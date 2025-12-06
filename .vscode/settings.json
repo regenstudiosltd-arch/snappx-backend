@@ -1,0 +1,15 @@
+{
+  "cSpell.words": [
+    "auditlog",
+    "collectstatic",
+    "dxwrv",
+    "gunicorn",
+    "MOMO",
+    "noinput",
+    "psycopg",
+    "PYTHONUNBUFFERED",
+    "rabbitmq",
+    "snappx",
+    "staticfiles"
+  ]
+}
