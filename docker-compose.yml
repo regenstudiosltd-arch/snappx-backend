@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=snappx
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=reptile
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672" # Management UI: http://localhost:15672 (guest/guest)
+
+  celery:
+    build: .
+    command: celery -A core worker -l info
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+      - rabbitmq
+    environment:
+      - DEBUG=False
+
+  celery-beat:
+    build: .
+    command: celery -A core beat -l info
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+      - rabbitmq
+
+  web:
+    build: .
+    command: gunicorn core.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DEBUG=True
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    depends_on:
+      - web
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
