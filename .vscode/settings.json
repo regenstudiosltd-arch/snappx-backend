@@ -1,9 +1,11 @@
 {
   "cSpell.words": [
     "auditlog",
+    "clientid",
     "collectstatic",
     "dxwrv",
     "gunicorn",
+    "HUBTEL",
     "MOMO",
     "noinput",
     "psycopg",
