@@ -1,54 +1,56 @@
-import base64
-import requests
 from celery import shared_task
+import requests
 from django.conf import settings
 
-HUBTEL_OTP_URL = "https://api-otp.hubtel.com/otp"
-AUTH_HEADER = f"Basic {settings.HUBTEL_OTP_AUTH}"
+DAWUROBO_BASE = "https://devs.sms.api.dawurobo.com/v1/otp"
+
 HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": AUTH_HEADER
+    "accept": "application/json",
+    "x-api-key": settings.DAWUROBO_API_KEY,
+    "x-access-token": settings.DAWUROBO_ACCESS_TOKEN,
+    "Content-Type": "application/json"
 }
 
-@shared_task
-def send_hubtel_otp(phone_number: str, country_code: str = "GH"):
+@shared_task(bind=True, max_retries=1, default_retry_delay=10)
+def send_dawurobo_otp(self, phone_number: str):
     payload = {
-        "senderId": settings.HUBTEL_SENDER_ID,
-        "phoneNumber": phone_number,
-        "countryCode": country_code
+        "senderid": settings.DAWUROBO_SENDER_ID,
+        "number": phone_number.replace("+", ""),
+        "messagetemplate": "Your SnappX verification code is: %OTPCODE%. Expires in %EXPIRY% minutes.",
+        "expiry": 10,
+        "length": 6,
+        "type": "NUMERIC"
     }
-
     try:
-        response = requests.post(f"{HUBTEL_OTP_URL}/send", json=payload, headers=HEADERS)
+        response = requests.post(f"{DAWUROBO_BASE}/generate", json=payload, headers=HEADERS, timeout=15)
+
+        if response.status_code == 409:
+            print(f"OTP already active for {phone_number} — normal & expected")
+            return {"success": True, "note": "OTP already sent recently"}
+
         response.raise_for_status()
-        data = response.json()
+        print(f"OTP successfully sent to {phone_number}")
+        return {"success": True, "data": response.json()}
 
-        if data.get("code") == "0000":
-            request_id = data["data"]["requestId"]
-            prefix = data["data"]["prefix"]
-            print(f"OTP sent! RequestId: {request_id}, Prefix: {prefix}")
-            return {"request_id": request_id, "prefix": prefix}
-        else:
-            print(f"Hubtel error: {data}")
-            return {"error": data.get("message")}
     except Exception as e:
-        print(f"Hubtel OTP failed: {e}")
-        return {"error": str(e)}
+        print(f"DAWUROBO ERROR → {e}")
+        return {"success": False, "error": str(e)}
 
 
 @shared_task
-def verify_hubtel_otp(request_id: str, prefix: str, code: str):
+def verify_dawurobo_otp(phone_number: str, code: str):
     payload = {
-        "requestId": request_id,
-        "prefix": prefix,
-        "code": code
+        "otpcode": code.upper(),
+        "number": phone_number.replace("+", "")
     }
 
     try:
-        response = requests.post(f"{HUBTEL_OTP_URL}/verify", json=payload, headers=HEADERS)
-        if response.status_code == 200:
-            return {"success": True, "message": "OTP verified!"}
+        response = requests.post(f"{DAWUROBO_BASE}/verify", json=payload, headers=HEADERS)
+        if response.status_code == 200 and "success" in response.text:
+            print(f"OTP verified for {phone_number}")
+            return {"success": True}
         else:
+            print(f"Invalid OTP: {response.text}")
             return {"success": False, "error": "Invalid or expired OTP"}
     except Exception as e:
         return {"success": False, "error": str(e)}
