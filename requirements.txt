@@ -5,6 +5,7 @@ djangorestframework-simplejwt
 python-decouple==3.8
 psycopg[binary]==3.3.1
 gunicorn==23.0.0
+dj-database-url==2.2.0
 
 # Cloudinary & Images
 Pillow==10.4.0
