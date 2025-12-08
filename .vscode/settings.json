@@ -5,12 +5,15 @@
     "collectstatic",
     "dxwrv",
     "gunicorn",
+    "healthcheck",
     "HUBTEL",
+    "isready",
     "MOMO",
     "noinput",
     "psycopg",
     "PYTHONUNBUFFERED",
     "rabbitmq",
+    "senderid",
     "snappx",
     "staticfiles"
   ]
