@@ -4,7 +4,7 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from django.contrib.auth import get_user_model
 from .models import Profile
-from .tasks import send_dawurobo_otp, verify_dawurobo_otp
+from .tasks import send_dawurobo_otp, verify_dawurobo_otp, verify_dawurobo_otp_sync
 from .serializers import SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer
 import cloudinary.uploader
 from celery.exceptions import OperationalError
@@ -60,9 +60,9 @@ class ResetPasswordView(APIView):
         code = serializer.validated_data['code']
         new_password = serializer.validated_data['password']
 
-        result = verify_dawurobo_otp.delay(phone, code).get(timeout=15)
+        verify_dawurobo_otp.delay(phone, code)
 
-        if result.get("success"):
+        if verify_dawurobo_otp_sync(phone, code):
             try:
                 profile = Profile.objects.get(momo_number=phone)
                 user = profile.user
@@ -147,14 +147,20 @@ class SendOTPView(APIView):
         return Response(serializer.errors, status=400)
 class VerifyOTPView(APIView):
     permission_classes = [AllowAny]
+
     def post(self, request):
         serializer = VerifyOTPSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=400)
+
         phone = serializer.validated_data['phone_number']
         code = serializer.validated_data['code']
-        result = verify_dawurobo_otp.delay(phone, code).get(timeout=15)
-        if result.get("success"):
+
+        # Fire async task (optional — for logging)
+        verify_dawurobo_otp.delay(phone, code)
+
+        # Use SYNC version — instant, no timeout, works under network_mode: host
+        if verify_dawurobo_otp_sync(phone, code):
             try:
                 profile = Profile.objects.get(momo_number=phone)
                 profile.user.is_verified = True
