@@ -1,9 +1,12 @@
 {
   "cSpell.words": [
+    "adduser",
+    "appuser",
     "auditlog",
     "clientid",
     "collectstatic",
     "dxwrv",
+    "gecos",
     "gunicorn",
     "healthcheck",
     "HUBTEL",
@@ -11,6 +14,7 @@
     "MOMO",
     "noinput",
     "psycopg",
+    "PYTHONDONTWRITEBYTECODE",
     "PYTHONUNBUFFERED",
     "rabbitmq",
     "senderid",

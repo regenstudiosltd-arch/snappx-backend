@@ -1,24 +1,20 @@
 services:
   db:
     image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-snappx}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reptile}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_DB=snappx
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=reptile
-    ports:
-      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d snappx"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -27,60 +23,42 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
-    container_name: rabbitmq
-    hostname: rabbitmq
     environment:
-      - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
     ports:
-      - "5672:5672"
       - "15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmqctl", "status"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 20s
-    restart: unless-stopped
 
   celery:
     build: .
     command: celery -A core worker -l info --concurrency=2
-    volumes:
-      - .:/app
     depends_on:
       rabbitmq:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "celery", "-A", "core", "inspect", "ping"]
-      interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 20s
-    restart: unless-stopped
+      redis:
+        condition: service_healthy
+    environment:
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
 
   celery-beat:
     build: .
     command: celery -A core beat -l info
-    volumes:
-      - .:/app
     depends_on:
       rabbitmq:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "celery", "-A", "core", "inspect", "ping"]
-      interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 20s
 
   web:
     build: .
-    command: gunicorn core.wsgi:application --bind 0.0.0.0:8000 --timeout 120 --workers 3
-    volumes:
-      - .:/app
-    ports:
-      - "8000:8000"
+    command: gunicorn core.wsgi:application --bind 0.0.0.0:$PORT --timeout 120 --workers 3
+    environment:
+      - PORT=${PORT:-8000}
+      - DEBUG=False
     depends_on:
       db:
         condition: service_healthy
@@ -88,11 +66,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      - DEBUG=True
-      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-    restart: unless-stopped
 
   nginx:
     image: nginx:alpine
