@@ -22,7 +22,7 @@ def send_dawurobo_otp(self, phone_number: str):
         "type": "NUMERIC"
     }
     try:
-        response = requests.post(f"{DAWUROBO_BASE}/generate", json=payload, headers=HEADERS, timeout=15)
+        response = requests.post(f"{DAWUROBO_BASE}/generate", json=payload, headers=HEADERS, timeout=45)
 
         if response.status_code == 409:
             print(f"OTP already active for {phone_number} — normal & expected")
@@ -54,3 +54,31 @@ def verify_dawurobo_otp(phone_number: str, code: str):
             return {"success": False, "error": "Invalid or expired OTP"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def verify_dawurobo_otp_sync(phone_number: str, code: str) -> bool:
+    """
+    Synchronous version of OTP verification.
+    Used when Celery result backend is unreachable (network_mode: host).
+    """
+    payload = {
+        "otpcode": code.upper(),
+        "number": phone_number.replace("+", "")
+    }
+
+    try:
+        response = requests.post(
+            f"{DAWUROBO_BASE}/verify",
+            json=payload,
+            headers=HEADERS,
+            timeout=10
+        )
+        if response.status_code == 200 and "success" in response.text.lower():
+            print(f"[SYNC] OTP verified successfully for {phone_number}")
+            return True
+        else:
+            print(f"[SYNC] Invalid OTP response: {response.text}")
+            return False
+    except Exception as e:
+        print(f"[SYNC] DAWUROBO VERIFY ERROR → {e}")
+        return False
