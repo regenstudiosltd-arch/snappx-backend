@@ -10,6 +10,8 @@ import cloudinary.uploader
 from celery.exceptions import OperationalError
 import logging
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework.permissions import IsAuthenticated
+from .serializers import ProfileSerializer
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -165,3 +167,21 @@ class VerifyOTPView(APIView):
                 return Response({"error": "Account not found"}, status=404)
         else:
             return Response({"error": "Invalid or expired OTP"}, status=400)
+
+class MeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        profile = user.profile
+        user_data = {
+            "id": user.id,
+            "email": user.email,
+            "is_verified": user.is_verified,
+            "date_joined": user.date_joined,
+        }
+        profile_data = ProfileSerializer(profile).data
+        return Response({
+            "user": user_data,
+            "profile": profile_data
+        })
