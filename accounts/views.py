@@ -1,17 +1,21 @@
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
-from django.contrib.auth import get_user_model
-from django.db import transaction, IntegrityError
-from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
+from django.utils.decorators import method_decorator
+from rest_framework.parsers import MultiPartParser
+from django.db import transaction, IntegrityError
 from django_ratelimit.decorators import ratelimit
+from .serializers import SavingsGroupSerializer
+from django.contrib.auth import get_user_model
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework import generics
+from rest_framework import status
+from .models import SavingsGroup
 from .models import Profile
 
 from .serializers import (
-    SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer,
+    SavingsGroupCreateSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer,
     ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer
 )
 from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
@@ -41,9 +45,9 @@ class ForgotPasswordView(APIView):
 
         try:
             if '@' in login_field:
-                user = User.objects.get(email=login_field)
+                user = User.objects.select_related('profile').get(email=login_field)
             else:
-                user = User.objects.get(profile__momo_number=login_field)
+                user = User.objects.select_related('profile').get(profile__momo_number=login_field)
         except User.DoesNotExist:
             return Response({"error": "User not found with this email or phone"},
                             status=status.HTTP_404_NOT_FOUND)
@@ -226,7 +230,7 @@ class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user = request.user
+        user = User.objects.select_related('profile').get(pk=request.user.pk)
         profile = user.profile
         return Response({
             "user": {
@@ -237,3 +241,51 @@ class MeView(APIView):
             },
             "profile": ProfileSerializer(profile).data
         })
+
+
+class CreateSavingsGroupView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        serializer = SavingsGroupCreateSerializer(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            group = serializer.save()
+            return Response({
+                "success": True,
+                "message": "Savings group created successfully! Awaiting admin approval.",
+                "group": {
+                    "id": group.id,
+                    "name": group.group_name,
+                    "status": group.status,
+                    "created_at": group.created_at
+                }
+            }, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.error(f"Group creation failed: {e}")
+            return Response({
+                "error": "Failed to create group. Please try again."
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class MyGroupsListView(generics.ListAPIView):
+    """Groups where user is the admin"""
+    serializer_class = SavingsGroupSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return SavingsGroup.objects.filter(admin=self.request.user).select_related('admin__profile')
+
+class GroupDetailView(generics.RetrieveAPIView):
+    """Single group detail"""
+    serializer_class = SavingsGroupSerializer
+    permission_classes = [IsAuthenticated]
+    lookup_field = 'id'
+
+    def get_queryset(self):
+        # user sees any group they are part of or created
+        user = self.request.user
+        return SavingsGroup.objects.filter(admin=user)
