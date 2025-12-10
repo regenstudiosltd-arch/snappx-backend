@@ -1,5 +1,9 @@
 from django.urls import path
-from .views import FullSignupView, SendOTPView, VerifyOTPView, CustomLoginView, TokenRefreshView, ForgotPasswordView, ResetPasswordView, MeView
+from .views import (
+    FullSignupView, SendOTPView, VerifyOTPView,
+    CustomLoginView, ForgotPasswordView, ResetPasswordView, MeView
+)
+from rest_framework_simplejwt.views import TokenRefreshView
 
 urlpatterns = [
     path('signup/', FullSignupView.as_view(), name='signup'),
