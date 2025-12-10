@@ -40,7 +40,7 @@ class Profile(models.Model):
         max_length=20,
         validators=[RegexValidator(r'^[A-Z]{2}-\d{3}-\d{4}$', 'Format: GA-123-4567')]
     )
-    profile_picture = models.ImageField(upload_to='profiles/', blank=True, null=True)
+    profile_picture = models.URLField(max_length=1000, blank=True, null=True, verbose_name="Profile Picture URL")
     momo_provider = models.CharField(max_length=20, choices=MOMO_PROVIDER_CHOICES)
     momo_number = PhoneNumberField(unique=True)
     momo_name = models.CharField(max_length=255)

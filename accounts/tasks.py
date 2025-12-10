@@ -1,7 +1,7 @@
-from celery import shared_task
 import requests
 from django.conf import settings
 
+# Dawurobo API constants
 DAWUROBO_BASE = "https://devs.sms.api.dawurobo.com/v1/otp"
 
 HEADERS = {
@@ -11,61 +11,75 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=10)
-def send_dawurobo_otp(self, phone_number: str):
+
+def send_dawurobo_otp_sync(phone_number: str) -> dict:
+    """
+    Synchronous version used in local development.
+    Works exactly like the old .delay() version but runs immediately.
+    """
     payload = {
         "senderid": settings.DAWUROBO_SENDER_ID,
-        "number": phone_number.replace("+", ""),
+        "number": phone_number.replace("+", "").replace(" ", ""),
         "messagetemplate": "Your SnappX verification code is: %OTPCODE%. Expires in %EXPIRY% minutes.",
         "expiry": 10,
         "length": 6,
         "type": "NUMERIC"
     }
+
     try:
-        response = requests.post(f"{DAWUROBO_BASE}/generate", json=payload, headers=HEADERS, timeout=45)
-        if response.status_code == 409:
-            print(f"OTP already active for {phone_number} — expected")
-            return {"success": True, "note": "Already active"}
+        response = requests.post(
+            f"{DAWUROBO_BASE}/generate",
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        if response.status_code in (200, 201, 409):
+            print(f"OTP sent successfully to {phone_number}")
+            return {"success": True, "status_code": response.status_code}
+
         response.raise_for_status()
-        print(f"OTP sent successfully to {phone_number}")
         return {"success": True}
-    except Exception as e:
+
+    except requests.exceptions.RequestException as e:
         print(f"DAWUROBO SEND ERROR → {e}")
-        raise self.retry(exc=e)
-
-
-@shared_task
-def verify_dawurobo_otp(phone_number: str, code: str):
-    payload = {"otpcode": code.upper(), "number": phone_number.replace("+", "")}
-    try:
-        response = requests.post(f"{DAWUROBO_BASE}/verify", json=payload, headers=HEADERS, timeout=10)
-        return response.status_code == 200 and "success" in response.text.lower()
-    except Exception:
-        return False
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response: {e.response.text}")
+        return {"success": False, "error": str(e)}
 
 
 def verify_and_invalidate_otp_sync(phone_number: str, code: str) -> bool:
     """
-    Secure synchronous OTP verification + immediate invalidation.
-    Used for account verification and password reset.
+    Secure synchronous verification + immediate invalidation.
+    Used for signup verification and password reset.
     """
-    payload = {"otpcode": code.upper(), "number": phone_number.replace("+", "")}
+    clean_number = phone_number.replace("+", "").replace(" ", "")
+    verify_payload = {"otpcode": code.upper(), "number": clean_number}
 
     try:
-        verify_response = requests.post(f"{DAWUROBO_BASE}/verify", json=payload, headers=HEADERS, timeout=10)
-        if verify_response.status_code == 200 and "success" in verify_response.text.lower():
+        verify_resp = requests.post(
+            f"{DAWUROBO_BASE}/verify",
+            json=verify_payload,
+            headers=HEADERS,
+            timeout=10
+        )
+
+        success = verify_resp.status_code == 200 and "success" in verify_resp.text.lower()
+
+        if success:
             # Immediately invalidate to prevent reuse
             requests.post(
                 f"{DAWUROBO_BASE}/invalidate",
-                json={"number": phone_number.replace("+", "")},
+                json={"number": clean_number},
                 headers=HEADERS,
                 timeout=10
             )
-            print(f"[SECURE] OTP verified and invalidated: {phone_number}")
+            print(f"OTP verified and invalidated for {phone_number}")
             return True
         else:
-            print(f"[SECURE] Invalid OTP: {verify_response.text}")
+            print(f"Invalid OTP attempt: {verify_resp.text}")
             return False
+
     except Exception as e:
-        print(f"[SECURE] OTP verify/invalidate failed: {e}")
+        print(f"OTP verify/invalidate failed: {e}")
         return False
