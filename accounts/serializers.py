@@ -1,9 +1,10 @@
-from rest_framework import serializers
-from django.contrib.auth import get_user_model
-from .models import Profile
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from .models import GroupAdminKYC, Profile, SavingsGroup
 from rest_framework_simplejwt.tokens import RefreshToken
+from .models import GroupAdminKYC, SavingsGroup
+from django.contrib.auth import get_user_model
+from rest_framework import serializers
 from django.conf import settings
 
 User = get_user_model()
@@ -24,9 +25,9 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         # Find user by email or phone (momo_number)
         try:
             if '@' in login_field:
-                user = User.objects.get(email=login_field)
+                user = User.objects.select_related('profile').get(email=login_field)
             else:
-                user = User.objects.get(profile__momo_number=login_field)
+                user = User.objects.select_related('profile').get(profile__momo_number=login_field)
         except User.DoesNotExist:
             raise AuthenticationFailed('No user found with this email or phone')
 
@@ -91,3 +92,78 @@ class ResetPasswordSerializer(serializers.Serializer):
         if data['password'] != data['password2']:
             raise ValidationError("Passwords don't match")
         return data
+
+class GroupAdminKYCSerializer(serializers.ModelSerializer):
+    # Cloudinary private uploads — no "required=" argument
+    ghana_card_front = serializers.ImageField(
+        required=True,
+        write_only=True,
+        help_text="Upload Ghana Card front"
+    )
+    ghana_card_back = serializers.ImageField(
+        required=True,
+        write_only=True,
+        help_text="Upload Ghana Card back"
+    )
+    live_photo = serializers.ImageField(
+        required=True,
+        write_only=True,
+        help_text="Upload live selfie"
+    )
+
+    class Meta:
+        model = GroupAdminKYC
+        fields = ['ghana_card_front', 'ghana_card_back', 'live_photo']
+
+    def create(self, validated_data):
+        user = self.context['request'].user
+        return GroupAdminKYC.objects.create(user=user, **validated_data)
+
+
+class SavingsGroupCreateSerializer(serializers.ModelSerializer):
+    kyc = GroupAdminKYCSerializer(required=True)
+
+    class Meta:
+        model = SavingsGroup
+        fields = [
+            'group_name',
+            'contribution_amount',
+            'frequency',
+            'payout_timeline_days',
+            'expected_members',
+            'description',
+            'kyc'
+        ]
+
+    def create(self, validated_data):
+        kyc_data = validated_data.pop('kyc')
+        user = self.context['request'].user
+
+        kyc = GroupAdminKYC(user=user)
+        kyc.ghana_card_front = kyc_data['ghana_card_front']
+        kyc.ghana_card_back = kyc_data['ghana_card_back']
+        kyc.live_photo = kyc_data['live_photo']
+        kyc.save()
+
+        group = SavingsGroup.objects.create(
+            admin=user,
+            status='pending',
+            **validated_data
+        )
+
+        return group
+class SavingsGroupSerializer(serializers.ModelSerializer):
+    admin_name = serializers.CharField(source='admin.profile.full_name', read_only=True)
+    admin_phone = serializers.CharField(source='admin.profile.momo_number', read_only=True)
+    admin_photo = serializers.URLField(source='admin.profile.profile_picture', read_only=True, allow_null=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = SavingsGroup
+        fields = [
+            'id', 'group_name', 'contribution_amount', 'frequency',
+            'payout_timeline_days', 'expected_members', 'current_members',
+            'description', 'status', 'status_display', 'created_at',
+            'admin_name', 'admin_phone', 'admin_photo'
+        ]
+        read_only_fields = ['status', 'current_members', 'created_at']
