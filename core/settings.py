@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = config('SECRET_KEY')  # This is now safe because it's quoted in .env
 # DEBUG = config('DEBUG', default=False, cast=bool)
-ALLOWED_HOSTS = ['localhost', '127.0.0.1',]  # Add your domain later
+# ALLOWED_HOSTS = ['localhost', '127.0.0.1',]  # Add your domain later
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=False, cast=bool)
@@ -111,16 +111,28 @@ TEMPLATES = [
 WSGI_APPLICATION = 'core.wsgi.application'
 
 # Database Configuration
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': config('POSTGRES_DB', default='snappx'),
+#         'USER': 'postgres',
+#         'PASSWORD': 'reptile',
+#         'HOST': 'db',
+#         'PORT': '5432',
+#     }
+# }
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('POSTGRES_DB', default='snappx'),
-        'USER': 'postgres',
-        'PASSWORD': 'reptile',
-        'HOST': 'db',
-        'PORT': '5432',
+        'NAME': config('POSTGRES_DB'),
+        'USER': config('POSTGRES_USER'),
+        'PASSWORD': config('POSTGRES_PASSWORD'),
+        'HOST': config('POSTGRES_HOST'),
+        'PORT': config('POSTGRES_PORT', cast=int),
     }
 }
+
 
 # Custom User Model
 AUTH_USER_MODEL = 'accounts.User'
