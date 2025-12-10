@@ -1,8 +1,7 @@
-import os
-from pathlib import Path
-from decouple import config
 from datetime import timedelta
 from dotenv import load_dotenv
+from decouple import config
+from pathlib import Path
 
 # Load .env file
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -128,10 +127,12 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),   # longer in dev
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'UPDATE_LAST_LOGIN': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
