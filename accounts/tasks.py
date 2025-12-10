@@ -11,7 +11,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-@shared_task(bind=True, max_retries=1, default_retry_delay=10)
+@shared_task(bind=True, max_retries=3, default_retry_delay=10)
 def send_dawurobo_otp(self, phone_number: str):
     payload = {
         "senderid": settings.DAWUROBO_SENDER_ID,
@@ -23,62 +23,49 @@ def send_dawurobo_otp(self, phone_number: str):
     }
     try:
         response = requests.post(f"{DAWUROBO_BASE}/generate", json=payload, headers=HEADERS, timeout=45)
-
         if response.status_code == 409:
-            print(f"OTP already active for {phone_number} — normal & expected")
-            return {"success": True, "note": "OTP already sent recently"}
-
+            print(f"OTP already active for {phone_number} — expected")
+            return {"success": True, "note": "Already active"}
         response.raise_for_status()
-        print(f"OTP successfully sent to {phone_number}")
-        return {"success": True, "data": response.json()}
-
+        print(f"OTP sent successfully to {phone_number}")
+        return {"success": True}
     except Exception as e:
-        print(f"DAWUROBO ERROR → {e}")
-        return {"success": False, "error": str(e)}
+        print(f"DAWUROBO SEND ERROR → {e}")
+        raise self.retry(exc=e)
 
 
 @shared_task
 def verify_dawurobo_otp(phone_number: str, code: str):
-    payload = {
-        "otpcode": code.upper(),
-        "number": phone_number.replace("+", "")
-    }
+    payload = {"otpcode": code.upper(), "number": phone_number.replace("+", "")}
+    try:
+        response = requests.post(f"{DAWUROBO_BASE}/verify", json=payload, headers=HEADERS, timeout=10)
+        return response.status_code == 200 and "success" in response.text.lower()
+    except Exception:
+        return False
+
+
+def verify_and_invalidate_otp_sync(phone_number: str, code: str) -> bool:
+    """
+    Secure synchronous OTP verification + immediate invalidation.
+    Used for account verification and password reset.
+    """
+    payload = {"otpcode": code.upper(), "number": phone_number.replace("+", "")}
 
     try:
-        response = requests.post(f"{DAWUROBO_BASE}/verify", json=payload, headers=HEADERS)
-        if response.status_code == 200 and "success" in response.text:
-            print(f"OTP verified for {phone_number}")
-            return {"success": True}
-        else:
-            print(f"Invalid OTP: {response.text}")
-            return {"success": False, "error": "Invalid or expired OTP"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-def verify_dawurobo_otp_sync(phone_number: str, code: str) -> bool:
-    """
-    Synchronous version of OTP verification.
-    Used when Celery result backend is unreachable (network_mode: host).
-    """
-    payload = {
-        "otpcode": code.upper(),
-        "number": phone_number.replace("+", "")
-    }
-
-    try:
-        response = requests.post(
-            f"{DAWUROBO_BASE}/verify",
-            json=payload,
-            headers=HEADERS,
-            timeout=10
-        )
-        if response.status_code == 200 and "success" in response.text.lower():
-            print(f"[SYNC] OTP verified successfully for {phone_number}")
+        verify_response = requests.post(f"{DAWUROBO_BASE}/verify", json=payload, headers=HEADERS, timeout=10)
+        if verify_response.status_code == 200 and "success" in verify_response.text.lower():
+            # Immediately invalidate to prevent reuse
+            requests.post(
+                f"{DAWUROBO_BASE}/invalidate",
+                json={"number": phone_number.replace("+", "")},
+                headers=HEADERS,
+                timeout=10
+            )
+            print(f"[SECURE] OTP verified and invalidated: {phone_number}")
             return True
         else:
-            print(f"[SYNC] Invalid OTP response: {response.text}")
+            print(f"[SECURE] Invalid OTP: {verify_response.text}")
             return False
     except Exception as e:
-        print(f"[SYNC] DAWUROBO VERIFY ERROR → {e}")
+        print(f"[SECURE] OTP verify/invalidate failed: {e}")
         return False
