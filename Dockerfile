@@ -6,6 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# INSTALL ESSENTIAL SYSTEM DEPENDENCIES
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
