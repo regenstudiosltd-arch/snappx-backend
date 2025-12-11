@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'cloudinary_storage',
     'django_otp',
     'qrcode',
+    'drf_spectacular',
 
     'accounts',
 ]
@@ -184,3 +185,11 @@ AUTHENTICATION_BACKENDS = [
 AXES_FAILURE_LIMIT = 5
 AXES_COOLOFF_TIME = 30
 AXES_LOCK_OUT_AT_FAILURE = True
+
+# DRF Spectacular Settings
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Snappx Backend API',
+    'DESCRIPTION': 'Documentation for the Snappx REST API endpoints.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+}
