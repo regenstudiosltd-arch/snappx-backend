@@ -186,10 +186,24 @@ AXES_FAILURE_LIMIT = 5
 AXES_COOLOFF_TIME = 30
 AXES_LOCK_OUT_AT_FAILURE = True
 
-# DRF Spectacular Settings
+# drf-spectacular settings
 SPECTACULAR_SETTINGS = {
     'TITLE': 'Snappx Backend API',
     'DESCRIPTION': 'Documentation for the Snappx REST API endpoints.',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
+    'SECURITY': [
+        {
+            'BearerAuth': []
+        }
+    ],
+    'COMPONENTS': {
+        'securitySchemes': {
+            'BearerAuth': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+            }
+        }
+    },
 }
