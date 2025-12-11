@@ -1,5 +1,5 @@
-from .serializers import SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer, FullSignupSerializer
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
+from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership
 from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -14,15 +14,14 @@ from rest_framework.filters import SearchFilter
 from django.contrib.auth import get_user_model
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework import serializers
-from rest_framework import generics
-from rest_framework import status
-from .models import SavingsGroup
-from .models import Profile
+from rest_framework import generics, status
+from .permissions import IsGroupAdmin
+from django.utils import timezone
 
 from .serializers import (
-    SavingsGroupCreateSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer,
-    ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer
+    SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
+    CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
+    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer
 )
 
 import cloudinary.uploader
@@ -411,3 +410,130 @@ class AllGroupsListView(generics.ListAPIView):
             .filter(status='active')
             .select_related('admin__profile')
         )
+
+@extend_schema(
+    request=None,
+    responses={
+        201: {'description': 'Request submitted successfully.'},
+        400: {'description': 'Already a member or request pending.'},
+        404: {'description': 'Group not found or not active.'}
+    },
+    description="Allows an authenticated user to submit a join request to an active group.",
+    tags=['Savings Groups']
+)
+class GroupJoinRequestView(APIView):
+    """Endpoint for users to request to join a group."""
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, group_id):
+        try:
+            group = SavingsGroup.objects.get(id=group_id, status='active')
+        except SavingsGroup.DoesNotExist:
+            return Response({"error": "Group not found or not currently active."},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+
+        # Check if already an approved member
+        if GroupMembership.objects.filter(user=user, group=group).exists():
+            return Response({"error": "You are already a member of this group."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Check for an existing pending request
+        request_exists = GroupJoinRequest.objects.filter(user=user, group=group, status__in=['pending', 'approved']).exists()
+        if request_exists:
+            return Response({"error": "You already have a pending or approved request for this group."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Create the request
+        GroupJoinRequest.objects.create(user=user, group=group, status='pending')
+
+        return Response({"message": f"Join request sent to admin of {group.group_name}."},
+                        status=status.HTTP_201_CREATED)
+
+
+@extend_schema(
+    responses={
+        200: GroupJoinRequestSerializer(many=True),
+        403: {'description': 'User is not the group admin.'}
+    },
+    description="Group Admin can view all pending join requests for their specific group.",
+    tags=['Savings Groups']
+)
+class GroupRequestsListView(generics.ListAPIView):
+    """Endpoint for Group Admin to list pending join requests."""
+    serializer_class = GroupJoinRequestSerializer
+    permission_classes = [IsAuthenticated, IsGroupAdmin]
+
+    def get_queryset(self):
+        group_id = self.kwargs.get('group_id')
+
+        # Check if the requesting user is the admin of the group
+        try:
+            group = SavingsGroup.objects.get(id=group_id, admin=self.request.user)
+        except SavingsGroup.DoesNotExist:
+            raise rest_serializers.ValidationError({"error": "Group not found or you are not the admin."})
+
+        return GroupJoinRequest.objects.filter(
+            group=group,
+            status='pending'
+        ).select_related('user__profile', 'group')
+
+
+@extend_schema(
+    request=GroupJoinActionSerializer,
+    responses={
+        200: {'description': 'Request handled successfully.'},
+        400: {'description': 'Invalid action or request already handled.'},
+        403: {'description': 'User is not the group admin.'},
+        404: {'description': 'Request not found.'}
+    },
+    description="Group Admin approves or rejects a pending join request.",
+    tags=['Savings Groups']
+)
+class GroupRequestActionView(APIView):
+    """Endpoint for Group Admin to approve or reject a specific join request."""
+    permission_classes = [IsAuthenticated, IsGroupAdmin]
+
+    def get_object(self, pk):
+        try:
+            request_obj = GroupJoinRequest.objects.get(pk=pk)
+            self.check_object_permissions(self.request, request_obj)
+            return request_obj
+        except GroupJoinRequest.DoesNotExist:
+            raise status.HTTP_404_NOT_FOUND
+
+    @transaction.atomic
+    def post(self, request, pk):
+        request_obj = self.get_object(pk)
+
+        serializer = GroupJoinActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        action = serializer.validated_data['action']
+
+        if request_obj.status != 'pending':
+            return Response({"error": f"Request is already {request_obj.status}."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if action == 'approve':
+            # Create a membership record
+            GroupMembership.objects.create(user=request_obj.user, group=request_obj.group)
+
+            # Increment group member count
+            request_obj.group.current_members += 1
+            request_obj.group.save(update_fields=['current_members'])
+
+            request_obj.status = 'approved'
+            message = "User approved and added to the group."
+
+        elif action == 'reject':
+            request_obj.status = 'rejected'
+            message = "User request has been rejected."
+
+        # Finalize the request object
+        request_obj.handled_by = request.user
+        request_obj.handled_at = timezone.now()
+        request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
+
+        return Response({"message": message}, status=status.HTTP_200_OK)
