@@ -1,4 +1,4 @@
-from .models import GroupAdminKYC, SavingsGroup
+from .models import GroupAdminKYC, SavingsGroup, GroupJoinRequest, GroupMembership
 from django.utils.html import format_html
 from django.utils import timezone
 from django.contrib import admin
@@ -117,3 +117,18 @@ class SavingsGroupAdmin(admin.ModelAdmin):
     def reject_groups(self, request, queryset):
         queryset.update(status='rejected')
     reject_groups.short_description = "Reject selected groups"
+
+@admin.register(GroupJoinRequest)
+class GroupJoinRequestAdmin(admin.ModelAdmin):
+    list_display = ['user', 'group', 'status', 'requested_at', 'handled_by']
+    list_filter = ['status', 'requested_at']
+    search_fields = ['user__email', 'group__group_name']
+    readonly_fields = ['user', 'group', 'requested_at', 'handled_by', 'handled_at']
+
+
+@admin.register(GroupMembership)
+class GroupMembershipAdmin(admin.ModelAdmin):
+    list_display = ['user', 'group', 'joined_at']
+    list_filter = ['joined_at']
+    search_fields = ['user__email', 'group__group_name']
+    readonly_fields = ['user', 'group', 'joined_at']
