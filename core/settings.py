@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'django_otp',
     'qrcode',
     'drf_spectacular',
+    'django_filters',
 
     'accounts',
 ]
