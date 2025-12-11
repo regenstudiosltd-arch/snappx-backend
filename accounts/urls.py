@@ -1,6 +1,6 @@
 from .views import (
     CreateSavingsGroupView, MyGroupsListView, GroupDetailView, FullSignupView, SendOTPView, VerifyOTPView,
-    CustomLoginView, ForgotPasswordView, ResetPasswordView, MeView
+    CustomLoginView, ForgotPasswordView, ResetPasswordView, MeView, AllGroupsListView
 )
 from rest_framework_simplejwt.views import TokenRefreshView
 from django.urls import path
@@ -18,5 +18,6 @@ urlpatterns = [
     # groups endpoints
     path('groups/create/', CreateSavingsGroupView.as_view(), name='create-savings-group'),
     path('groups/my-groups/', MyGroupsListView.as_view(), name='my-groups'),
+    path('groups/all/', AllGroupsListView.as_view(), name='all-groups'),
     path('groups/<int:id>/', GroupDetailView.as_view(), name='group-detail'),
 ]
