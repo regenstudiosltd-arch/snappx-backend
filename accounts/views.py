@@ -15,7 +15,7 @@ from rest_framework import status
 from .models import SavingsGroup
 from .models import Profile
 from drf_spectacular.utils import extend_schema, OpenApiParameter
-
+from rest_framework import serializers as rest_serializers
 
 from .serializers import (
     SavingsGroupCreateSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer,
@@ -25,8 +25,6 @@ from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
 
 import cloudinary.uploader
 import logging
-
-from accounts import serializers
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -253,9 +251,9 @@ class VerifyOTPView(APIView):
             return Response({"error": "Invalid or expired OTP"}, status=400)
 
 
-class MeViewResponseSerializer(serializers.Serializer):
-    user = serializers.DictField(
-        child=serializers.CharField(),
+class MeViewResponseSerializer(rest_serializers.Serializer):
+    user = rest_serializers.DictField(
+        child=rest_serializers.CharField(),
         help_text="Basic user fields like ID, email, and verification status."
     )
     profile = ProfileSerializer()
