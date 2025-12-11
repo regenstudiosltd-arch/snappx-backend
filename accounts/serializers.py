@@ -50,6 +50,58 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'access': str(refresh.access_token),
         }
 
+
+class FullSignupSerializer(serializers.Serializer):
+    """
+    Serializer used solely for documenting the FullSignupView request body.
+    The validation and creation logic remains in the view.
+    """
+    email = serializers.EmailField(
+        max_length=255,
+        help_text="User's email address."
+    )
+    password = serializers.CharField(
+        write_only=True,
+        min_length=8,
+        help_text="Desired password."
+    )
+    password2 = serializers.CharField(
+        write_only=True,
+        help_text="Password confirmation."
+    )
+    full_name = serializers.CharField(
+        max_length=255,
+        help_text="Full name of the user."
+    )
+    date_of_birth = serializers.DateField(
+        help_text="Date of birth (YYYY-MM-DD)."
+    )
+    user_type = serializers.ChoiceField(
+        choices=[('individual', 'Individual'), ('business', 'Business')],
+        help_text="Type of user: 'individual' or 'business'."
+    )
+    ghana_post_address = serializers.CharField(
+        max_length=255,
+        help_text="User's Ghana Post Digital Address."
+    )
+    momo_provider = serializers.CharField(
+        max_length=50,
+        help_text="Mobile Money provider (e.g., MTN, Vodafone)."
+    )
+    momo_number = serializers.CharField(
+        max_length=15,
+        help_text="Mobile Money phone number."
+    )
+    momo_name = serializers.CharField(
+        max_length=255,
+        help_text="Name registered on the Mobile Money account."
+    )
+    profile_picture = serializers.FileField(
+        required=False,
+        allow_null=True,
+        help_text="Optional: User's profile photo (e.g., a selfie)."
+    )
+
 class SignupSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
     password2 = serializers.CharField(write_only=True)
