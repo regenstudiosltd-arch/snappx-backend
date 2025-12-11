@@ -1,23 +1,22 @@
-﻿--- Using Development Database ---
-[
-{
-  "model": "accounts.user",
-  "pk": 1,
-  "fields": {
-    "password": "pbkdf2_sha256$870000$zrzQuOqljNKLsWp8KCYnoQ$PYkn25OaHG+bASLO/ZVtYgIi6yS6xHqI9ssIRmJ4Mz8=",
-    "last_login": null,
-    "is_superuser": true,
-    "username": "regenstudios",
-    "first_name": "",
-    "last_name": "",
-    "is_staff": true,
-    "is_active": true,
-    "date_joined": "2025-12-11T01:10:08.535Z",
-    "email": "regenstudiosltd@gmail.com",
-    "phone_number": null,
-    "is_verified": false,
-    "groups": [],
-    "user_permissions": []
+﻿[
+  {
+    "model": "accounts.user",
+    "pk": 1,
+    "fields": {
+      "password": "pbkdf2_sha256$870000$zrzQuOqljNKLsWp8KCYnoQ$PYkn25OaHG+bASLO/ZVtYgIi6yS6xHqI9ssIRmJ4Mz8=",
+      "last_login": null,
+      "is_superuser": true,
+      "username": "regenstudios",
+      "first_name": "",
+      "last_name": "",
+      "is_staff": true,
+      "is_active": true,
+      "date_joined": "2025-12-11T01:10:08.535Z",
+      "email": "regenstudiosltd@gmail.com",
+      "phone_number": null,
+      "is_verified": false,
+      "groups": [],
+      "user_permissions": []
+    }
   }
-}
 ]
