@@ -1,6 +1,6 @@
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from .models import GroupAdminKYC, Profile, SavingsGroup
+from .models import GroupAdminKYC, Profile, SavingsGroup, GroupJoinRequest, GroupMembership
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import GroupAdminKYC, SavingsGroup
 from django.contrib.auth import get_user_model
@@ -219,3 +219,40 @@ class SavingsGroupSerializer(serializers.ModelSerializer):
             'admin_name', 'admin_phone', 'admin_photo'
         ]
         read_only_fields = ['status', 'current_members', 'created_at']
+
+
+class RequestingUserSerializer(serializers.ModelSerializer):
+    """Minimal serializer to show details of the user who submitted the request."""
+    full_name = serializers.CharField(source='profile.full_name', read_only=True)
+    momo_number = serializers.CharField(source='profile.momo_number', read_only=True)
+
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'full_name', 'momo_number']
+
+
+class GroupJoinRequestSerializer(serializers.ModelSerializer):
+    """Serializer for admin to view pending join requests."""
+    user_details = RequestingUserSerializer(source='user', read_only=True)
+    group_name = serializers.CharField(source='group.group_name', read_only=True)
+
+    class Meta:
+        model = GroupJoinRequest
+        fields = [
+            'id',
+            'group',
+            'group_name',
+            'user',
+            'user_details',
+            'status',
+            'requested_at'
+        ]
+        read_only_fields = ['group', 'user', 'status', 'requested_at', 'handled_by', 'handled_at']
+
+
+class GroupJoinActionSerializer(serializers.Serializer):
+    """Serializer for the admin to take an action (Approve/Reject)."""
+    action = serializers.ChoiceField(
+        choices=['approve', 'reject'],
+        help_text="Action to take on the request: 'approve' or 'reject'."
+    )

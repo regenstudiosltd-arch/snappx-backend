@@ -130,3 +130,79 @@ class SavingsGroup(models.Model):
     def clean(self):
         if self.current_members > self.expected_members:
             raise ValidationError("Current members cannot exceed expected members.")
+
+class GroupJoinRequest(models.Model):
+    """
+    Tracks a user's request to join a SavingsGroup, awaiting admin approval.
+    """
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('cancelled', 'Cancelled')
+    )
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='join_requests',
+        help_text="The user requesting to join."
+    )
+    group = models.ForeignKey(
+        'SavingsGroup',
+        on_delete=models.CASCADE,
+        related_name='join_requests',
+        help_text="The group the user is requesting to join."
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='pending',
+        db_index=True
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+
+    # Fields for Admin action
+    handled_by = models.ForeignKey(
+        User,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='handled_join_requests',
+        help_text="The admin who handled this request."
+    )
+    handled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        unique_together = ('user', 'group')
+        verbose_name = "Group Join Request"
+        verbose_name_plural = "Group Join Requests"
+        ordering = ['-requested_at']
+
+    def __str__(self):
+        return f"Request by {self.user.email} for {self.group.group_name} ({self.status})"
+
+class GroupMembership(models.Model):
+    """
+    Represents an active, approved member of a SavingsGroup.
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+        help_text="The active member."
+    )
+    group = models.ForeignKey(
+        'SavingsGroup',
+        on_delete=models.CASCADE,
+        related_name='members',
+        help_text="The group the user is a member of."
+    )
+    joined_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'group')
+        verbose_name = "Group Membership"
+        verbose_name_plural = "Group Memberships"
+
+    def __str__(self):
+        return f"{self.user.email} is a member of {self.group.group_name}"
