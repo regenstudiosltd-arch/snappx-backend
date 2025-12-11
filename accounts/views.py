@@ -5,14 +5,17 @@ from django.utils.decorators import method_decorator
 from rest_framework.parsers import MultiPartParser
 from django.db import transaction, IntegrityError
 from django_ratelimit.decorators import ratelimit
-from .serializers import SavingsGroupSerializer
+from .serializers import SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer, FullSignupSerializer
 from django.contrib.auth import get_user_model
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework import serializers
 from rest_framework import generics
 from rest_framework import status
 from .models import SavingsGroup
 from .models import Profile
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+
 
 from .serializers import (
     SavingsGroupCreateSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer,
@@ -22,6 +25,8 @@ from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
 
 import cloudinary.uploader
 import logging
+
+from accounts import serializers
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -34,6 +39,7 @@ class CustomLoginView(TokenObtainPairView):
 
 class ForgotPasswordView(APIView):
     permission_classes = [AllowAny]
+    serializer_class = ForgotPasswordSerializer
 
     @method_decorator(ratelimit(key='ip', rate='10/m', method='POST', block=True))
     def post(self, request):
@@ -66,8 +72,26 @@ class ForgotPasswordView(APIView):
 
 
 @method_decorator(never_cache, name='dispatch')
+@extend_schema(
+    request=FullSignupSerializer,
+    responses={
+        201: {
+            'type': 'object',
+            'properties': {
+                'message': {'type': 'string'},
+                'phone': {'type': 'string'},
+                'next_step': {'type': 'string'},
+            }
+        },
+        400: {'description': 'Validation or uniqueness error'},
+        500: {'description': 'Server or OTP sending error'},
+    },
+    description="Complete user and profile registration, including optional file upload. Triggers phone verification.",
+    tags=['Authentication & Registration']
+)
 class FullSignupView(APIView):
     permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser]
 
     @transaction.atomic
     def post(self, request):
@@ -158,6 +182,7 @@ class FullSignupView(APIView):
 @method_decorator([never_cache, ratelimit(key='ip', rate='5/m', method='POST', block=True)], name='dispatch')
 class ResetPasswordView(APIView):
     permission_classes = [AllowAny]
+    serializer_class = ResetPasswordSerializer
 
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
@@ -184,6 +209,7 @@ class ResetPasswordView(APIView):
 
 class SendOTPView(APIView):
     permission_classes = [AllowAny]
+    serializer_class = SendOTPSerializer
 
     @method_decorator(ratelimit(key='ip', rate='10/m', method='POST', block=True))
     def post(self, request):
@@ -202,6 +228,7 @@ class SendOTPView(APIView):
 
 class VerifyOTPView(APIView):
     permission_classes = [AllowAny]
+    serializer_class = VerifyOTPSerializer
 
     def post(self, request):
         serializer = VerifyOTPSerializer(data=request.data)
@@ -226,8 +253,21 @@ class VerifyOTPView(APIView):
             return Response({"error": "Invalid or expired OTP"}, status=400)
 
 
+class MeViewResponseSerializer(serializers.Serializer):
+    user = serializers.DictField(
+        child=serializers.CharField(),
+        help_text="Basic user fields like ID, email, and verification status."
+    )
+    profile = ProfileSerializer()
+
+
 class MeView(APIView):
     permission_classes = [IsAuthenticated]
+    @extend_schema(
+        responses={200: MeViewResponseSerializer},
+        description="Retrieves the current authenticated user's details and profile data.",
+        tags=['User Management']
+    )
 
     def get(self, request):
         user = User.objects.select_related('profile').get(pk=request.user.pk)
@@ -246,6 +286,7 @@ class MeView(APIView):
 class CreateSavingsGroupView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
+    serializer_class = SavingsGroupCreateSerializer
 
     def post(self, request):
         serializer = SavingsGroupCreateSerializer(data=request.data, context={'request': request})
@@ -270,7 +311,14 @@ class CreateSavingsGroupView(APIView):
                 "error": "Failed to create group. Please try again."
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
+@extend_schema(
+    description="Lists all savings groups created (and thus administered) by the authenticated user.",
+    tags=['Savings Groups'],
+    responses={
+        200: SavingsGroupSerializer(many=True),
+        401: {'description': 'Authentication credentials were not provided.'}
+    }
+)
 class MyGroupsListView(generics.ListAPIView):
     """Groups where user is the admin"""
     serializer_class = SavingsGroupSerializer
@@ -279,6 +327,24 @@ class MyGroupsListView(generics.ListAPIView):
     def get_queryset(self):
         return SavingsGroup.objects.filter(admin=self.request.user).select_related('admin__profile')
 
+@extend_schema(
+    parameters=[
+        OpenApiParameter(
+            name='id',
+            type=int,
+            location=OpenApiParameter.PATH,
+            description='The ID of the savings group.',
+            required=True
+        ),
+    ],
+    description="Retrieves the details of a single savings group. Access is restricted to the admin/creator.",
+    tags=['Savings Groups'],
+    responses={
+        200: SavingsGroupSerializer,
+        401: {'description': 'Authentication required.'},
+        404: {'description': 'Group not found or unauthorized access.'}
+    }
+)
 class GroupDetailView(generics.RetrieveAPIView):
     """Single group detail"""
     serializer_class = SavingsGroupSerializer
@@ -286,6 +352,5 @@ class GroupDetailView(generics.RetrieveAPIView):
     lookup_field = 'id'
 
     def get_queryset(self):
-        # user sees any group they are part of or created
         user = self.request.user
         return SavingsGroup.objects.filter(admin=user)
