@@ -1,11 +1,16 @@
+from .serializers import SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer, FullSignupSerializer
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
+from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import serializers as rest_serializers
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
 from rest_framework.parsers import MultiPartParser
 from django.db import transaction, IntegrityError
 from django_ratelimit.decorators import ratelimit
-from .serializers import SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer, FullSignupSerializer
+from rest_framework.filters import SearchFilter
 from django.contrib.auth import get_user_model
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -14,14 +19,11 @@ from rest_framework import generics
 from rest_framework import status
 from .models import SavingsGroup
 from .models import Profile
-from drf_spectacular.utils import extend_schema, OpenApiParameter
-from rest_framework import serializers as rest_serializers
 
 from .serializers import (
     SavingsGroupCreateSerializer, SendOTPSerializer, VerifyOTPSerializer, CustomTokenObtainPairSerializer,
     ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer
 )
-from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
 
 import cloudinary.uploader
 import logging
@@ -352,3 +354,60 @@ class GroupDetailView(generics.RetrieveAPIView):
     def get_queryset(self):
         user = self.request.user
         return SavingsGroup.objects.filter(admin=user)
+
+@extend_schema(
+    description="Lists all Active savings groups across the platform, allowing filtering and searching.",
+    tags=['Savings Groups'],
+    parameters=[
+        OpenApiParameter(
+            name='search',
+            type={'type': 'string'},
+            location=OpenApiParameter.QUERY,
+            description='Search by group name or description.'
+        ),
+        OpenApiParameter(
+            name='frequency',
+            type={'type': 'string'},
+            location=OpenApiParameter.QUERY,
+            description='Filter by contribution frequency (e.g., daily, weekly, monthly).'
+        ),
+        OpenApiParameter(
+            name='expected_members',
+            type={'type': 'integer'},
+            location=OpenApiParameter.QUERY,
+            description='Filter by exact expected number of members.'
+        ),
+    ],
+    examples=[
+        OpenApiExample(
+            name='Filter and Search Example',
+            description='Retrieve all weekly groups with "vacation" in the name/description.',
+            value={
+                'search': 'vacation',
+                'frequency': 'weekly'
+            },
+            request_only=True
+        ),
+    ],
+    responses={
+        200: SavingsGroupSerializer(many=True),
+        401: {'description': 'Authentication credentials were not provided.'}
+    }
+)
+class AllGroupsListView(generics.ListAPIView):
+    """Lists all active savings groups for the platform, with filtering and searching."""
+    serializer_class = SavingsGroupSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+
+    filterset_fields = ['frequency', 'expected_members', 'contribution_amount']
+
+    search_fields = ['group_name', 'description']
+
+    def get_queryset(self):
+        # Only show groups that have been approved by an admin
+        return (
+            SavingsGroup.objects
+            .filter(status='active')
+            .select_related('admin__profile')
+        )
