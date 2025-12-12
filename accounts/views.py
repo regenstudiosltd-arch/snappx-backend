@@ -1,6 +1,6 @@
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
 from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership
-from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync
+from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django_filters.rest_framework import DjangoFilterBackend
@@ -436,22 +436,41 @@ class GroupJoinRequestView(APIView):
         user = request.user
 
         # Check if already an approved member
-        if GroupMembership.objects.filter(user=user, group=group).exists():
+        if GroupMembership.objects.filter(user=user, group_id=group_id).exists():
             return Response({"error": "You are already a member of this group."},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # Check for an existing pending request
-        request_exists = GroupJoinRequest.objects.filter(user=user, group=group, status__in=['pending', 'approved']).exists()
-        if request_exists:
-            return Response({"error": "You already have a pending or approved request for this group."},
-                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            existing_request = GroupJoinRequest.objects.get(user=user, group_id=group_id)
 
-        # Create the request
-        GroupJoinRequest.objects.create(user=user, group=group, status='pending')
+            if existing_request.status == 'approved':
+                return Response({"error": "Your request was already approved."},
+                                status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({"message": f"Join request sent to admin of {group.group_name}."},
-                        status=status.HTTP_201_CREATED)
+            elif existing_request.status == 'pending':
+                return Response({"error": "You already have a pending request for this group."},
+                                status=status.HTTP_400_BAD_REQUEST)
 
+            elif existing_request.status == 'rejected':
+                existing_request.status = 'pending'
+                existing_request.requested_at = timezone.now()
+                existing_request.handled_at = None
+                existing_request.handled_by = None
+                existing_request.save(update_fields=['status', 'requested_at', 'handled_at', 'handled_by'])
+
+                send_group_join_request_email_async.delay(existing_request.id)
+
+                return Response({"message": f"Previous request re-submitted to admin of {group.group_name}."},
+                                status=status.HTTP_200_OK)
+
+        except GroupJoinRequest.DoesNotExist:
+            # 4. No request exists yet, so create a new one
+            new_request = GroupJoinRequest.objects.create(user=user, group=group, status='pending')
+
+            send_group_join_request_email_async.delay(new_request.id)
+
+            return Response({"message": f"Join request sent to admin of {group.group_name}. The admin has been notified via email."},
+                            status=status.HTTP_201_CREATED)
 
 @extend_schema(
     responses={
@@ -506,34 +525,65 @@ class GroupRequestActionView(APIView):
 
     @transaction.atomic
     def post(self, request, pk):
-        request_obj = self.get_object(pk)
+        try:
+            request_obj = GroupJoinRequest.objects.select_related('group__admin').get(pk=pk)
+        except GroupJoinRequest.DoesNotExist:
+            return Response({"error": "Join request not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        if request_obj.group.admin != request.user:
+            return Response({'detail': 'You are not authorized to handle this request.'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        # Validation of input action
         serializer = GroupJoinActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         action = serializer.validated_data['action']
 
+        # Status Check
         if request_obj.status != 'pending':
             return Response({"error": f"Request is already {request_obj.status}."},
                             status=status.HTTP_400_BAD_REQUEST)
 
         if action == 'approve':
-            # Create a membership record
-            GroupMembership.objects.create(user=request_obj.user, group=request_obj.group)
+            group = request_obj.group
 
-            # Increment group member count
-            request_obj.group.current_members += 1
-            request_obj.group.save(update_fields=['current_members'])
+            # Check if group is full
+            if group.current_members >= group.expected_members:
+                return Response({'error': 'Cannot approve. Group is already full.'},
+                                status=status.HTTP_400_BAD_REQUEST)
 
-            request_obj.status = 'approved'
-            message = "User approved and added to the group."
+            try:
+                GroupMembership.objects.create(user=request_obj.user, group=group)
+
+                # Increment group member count
+                group.current_members += 1
+                group.save(update_fields=['current_members'])
+
+                request_obj.status = 'approved'
+                request_obj.handled_by = request.user
+                request_obj.handled_at = timezone.now()
+                request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
+
+                send_group_join_response_email_async.delay(pk, 'approved')
+
+                message = "User approved and added to the group successfully."
+
+            except IntegrityError:
+                return Response({"error": "User is already a confirmed member of this group."},
+                                status=status.HTTP_400_BAD_REQUEST)
 
         elif action == 'reject':
             request_obj.status = 'rejected'
+            request_obj.handled_by = request.user
+            request_obj.handled_at = timezone.now()
+            request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
+
+            send_group_join_response_email_async.delay(pk, 'rejected')
+
             message = "User request has been rejected."
 
-        # Finalize the request object
-        request_obj.handled_by = request.user
-        request_obj.handled_at = timezone.now()
-        request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
+        else:
+            message = "Invalid action."
+            return Response({"error": message}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({"message": message}, status=status.HTTP_200_OK)
