@@ -29,6 +29,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.sites',
 
     'rest_framework',
     'rest_framework_simplejwt',
@@ -209,3 +210,31 @@ SPECTACULAR_SETTINGS = {
         }
     },
 }
+
+# Email Backend configuration
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.sendgrid.net'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'apikey'
+EMAIL_HOST_PASSWORD = os.environ.get('SENDGRID_API_KEY')
+
+DEFAULT_FROM_EMAIL = f'no-reply@{os.environ.get("SNAAPX_DOMAIN", "snappx.app")}'
+SERVER_EMAIL = EMAIL_HOST_USER
+
+# Site Configuration
+SITE_ID = 1
+
+CELERY_BROKER_URL = os.environ.get(
+    'CELERY_BROKER_URL',
+    'redis://localhost:6379/0'
+)
+CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+
+# Timezone setting
+CELERY_TIMEZONE = 'Africa/Accra'
+
+# Acceptable content formats
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'

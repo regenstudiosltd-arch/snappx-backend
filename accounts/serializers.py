@@ -50,7 +50,6 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'access': str(refresh.access_token),
         }
 
-
 class FullSignupSerializer(serializers.Serializer):
     """
     Serializer used solely for documenting the FullSignupView request body.
@@ -133,7 +132,6 @@ class VerifyOTPSerializer(serializers.Serializer):
 
 class ForgotPasswordSerializer(serializers.Serializer):
     login_field = serializers.CharField(required=True)
-
 class ResetPasswordSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=20, required=True)
     code = serializers.CharField(max_length=10, required=True)
@@ -144,9 +142,7 @@ class ResetPasswordSerializer(serializers.Serializer):
         if data['password'] != data['password2']:
             raise ValidationError("Passwords don't match")
         return data
-
 class GroupAdminKYCSerializer(serializers.ModelSerializer):
-    # Cloudinary private uploads — no "required=" argument
     ghana_card_front = serializers.ImageField(
         required=True,
         write_only=True,
@@ -171,7 +167,6 @@ class GroupAdminKYCSerializer(serializers.ModelSerializer):
         user = self.context['request'].user
         return GroupAdminKYC.objects.create(user=user, **validated_data)
 
-
 class SavingsGroupCreateSerializer(serializers.ModelSerializer):
     kyc = GroupAdminKYCSerializer(required=True)
 
@@ -187,21 +182,46 @@ class SavingsGroupCreateSerializer(serializers.ModelSerializer):
             'kyc'
         ]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if 'request' in self.context and self.context['request'].method == 'POST':
+            user = self.context['request'].user
+
+            self.kyc_exists = GroupAdminKYC.objects.filter(user=user).exists()
+
+            if self.kyc_exists:
+                self.fields['kyc'].required = False
+
+                kyc_fields = self.fields['kyc'].fields
+                for field_name in kyc_fields:
+                    kyc_fields[field_name].required = False
+
     def create(self, validated_data):
         kyc_data = validated_data.pop('kyc')
         user = self.context['request'].user
 
-        kyc = GroupAdminKYC(user=user)
-        kyc.ghana_card_front = kyc_data['ghana_card_front']
-        kyc.ghana_card_back = kyc_data['ghana_card_back']
-        kyc.live_photo = kyc_data['live_photo']
-        kyc.save()
+        kyc_exists = getattr(self, 'kyc_exists', GroupAdminKYC.objects.filter(user=user).exists())
 
+        if not kyc_exists:
+            GroupAdminKYC.objects.create(
+                user=user,
+                ghana_card_front=kyc_data.get('ghana_card_front'),
+                ghana_card_back=kyc_data.get('ghana_card_back'),
+                live_photo=kyc_data.get('live_photo')
+            )
+        else:
+            pass
+
+        # Create the Savings Group
         group = SavingsGroup.objects.create(
             admin=user,
             status='pending',
             **validated_data
         )
+
+        # Add the admin as a member of the group
+        GroupMembership.objects.create(user=user, group=group)
 
         return group
 class SavingsGroupSerializer(serializers.ModelSerializer):
@@ -220,7 +240,6 @@ class SavingsGroupSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['status', 'current_members', 'created_at']
 
-
 class RequestingUserSerializer(serializers.ModelSerializer):
     """Minimal serializer to show details of the user who submitted the request."""
     full_name = serializers.CharField(source='profile.full_name', read_only=True)
@@ -229,7 +248,6 @@ class RequestingUserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'email', 'full_name', 'momo_number']
-
 
 class GroupJoinRequestSerializer(serializers.ModelSerializer):
     """Serializer for admin to view pending join requests."""
@@ -248,7 +266,6 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
             'requested_at'
         ]
         read_only_fields = ['group', 'user', 'status', 'requested_at', 'handled_by', 'handled_at']
-
 
 class GroupJoinActionSerializer(serializers.Serializer):
     """Serializer for the admin to take an action (Approve/Reject)."""
