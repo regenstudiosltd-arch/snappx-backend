@@ -7,6 +7,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from django.conf import settings
 from django.db.models import Sum
+from drf_spectacular.utils import extend_schema_field, OpenApiTypes
 
 User = get_user_model()
 
@@ -291,9 +292,11 @@ class GroupDashboardCardSerializer(serializers.ModelSerializer):
             'contribution_amount', 'frequency'
         ]
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_next_payout_days(self, obj):
         return obj.days_until_next_payout
 
+    @extend_schema_field(OpenApiTypes.FLOAT)
     def get_user_total_contribution(self, obj):
         user = self.context['request'].user
         membership = GroupMembership.objects.filter(user=user, group=obj).first()
@@ -302,6 +305,7 @@ class GroupDashboardCardSerializer(serializers.ModelSerializer):
         total = membership.contributions.aggregate(total=Sum('amount'))['total']
         return float(total) if total else 0.0
 
+    @extend_schema_field(OpenApiTypes.FLOAT)
     def get_total_saved(self, obj):
         current_cycle = obj.current_cycle_number
         total = Contribution.objects.filter(
@@ -310,6 +314,7 @@ class GroupDashboardCardSerializer(serializers.ModelSerializer):
         ).aggregate(total=Sum('amount'))['total']
         return float(total) if total else 0.0
 
+    @extend_schema_field(OpenApiTypes.FLOAT)
     def get_progress_percentage(self, obj):
         current_cycle = obj.current_cycle_number
         total_contributed = Contribution.objects.filter(
