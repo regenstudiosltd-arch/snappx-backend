@@ -1,11 +1,12 @@
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from .models import GroupAdminKYC, Profile, SavingsGroup, GroupJoinRequest, GroupMembership
+from .models import GroupAdminKYC, Profile, SavingsGroup, GroupJoinRequest, GroupMembership, Contribution
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import GroupAdminKYC, SavingsGroup
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from django.conf import settings
+from django.db.models import Sum
 
 User = get_user_model()
 
@@ -273,3 +274,51 @@ class GroupJoinActionSerializer(serializers.Serializer):
         choices=['approve', 'reject'],
         help_text="Action to take on the request: 'approve' or 'reject'."
     )
+
+class GroupDashboardCardSerializer(serializers.ModelSerializer):
+    group_name = serializers.CharField(read_only=True)
+    current_members = serializers.IntegerField(read_only=True)
+    next_payout_days = serializers.SerializerMethodField()
+    user_total_contribution = serializers.SerializerMethodField()
+    total_saved = serializers.SerializerMethodField()
+    progress_percentage = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SavingsGroup
+        fields = [
+            'id', 'group_name', 'current_members', 'next_payout_days',
+            'user_total_contribution', 'total_saved', 'progress_percentage',
+            'contribution_amount', 'frequency'
+        ]
+
+    def get_next_payout_days(self, obj):
+        return obj.days_until_next_payout
+
+    def get_user_total_contribution(self, obj):
+        user = self.context['request'].user
+        membership = GroupMembership.objects.filter(user=user, group=obj).first()
+        if not membership:
+            return 0.0
+        total = membership.contributions.aggregate(total=Sum('amount'))['total']
+        return float(total) if total else 0.0
+
+    def get_total_saved(self, obj):
+        current_cycle = obj.current_cycle_number
+        total = Contribution.objects.filter(
+            membership__group=obj,
+            cycle_number=current_cycle
+        ).aggregate(total=Sum('amount'))['total']
+        return float(total) if total else 0.0
+
+    def get_progress_percentage(self, obj):
+        current_cycle = obj.current_cycle_number
+        total_contributed = Contribution.objects.filter(
+            membership__group=obj,
+            cycle_number=current_cycle
+        ).aggregate(total=Sum('amount'))['total'] or 0
+
+        expected_per_cycle = obj.contribution_amount * obj.expected_members
+        if expected_per_cycle == 0:
+            return 0.0
+        percentage = (total_contributed / expected_per_cycle) * 100
+        return round(percentage, 1)
