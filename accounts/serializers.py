@@ -322,3 +322,23 @@ class GroupDashboardCardSerializer(serializers.ModelSerializer):
             return 0.0
         percentage = (total_contributed / expected_per_cycle) * 100
         return round(percentage, 1)
+
+
+class DashboardResponseSerializer(serializers.Serializer):
+    """
+    Serializer defining the complete structure of the /api/accounts/dashboard/ GET response.
+    This resolves the drf-spectacular schema definition issues.
+    """
+    total_savings = serializers.FloatField(
+        help_text='Total amount saved by the user across all groups.'
+    )
+    growth_percentage = serializers.FloatField(
+        help_text='Percentage change in total savings compared to the previous month.'
+    )
+    growth_text = serializers.CharField(
+        help_text="A display string showing the growth (e.g., '+12.5% from last month')."
+    )
+    joined_groups = GroupDashboardCardSerializer(
+        many=True,
+        help_text='List of active groups the authenticated user is a member of.'
+    )

@@ -23,7 +23,7 @@ from dateutil.relativedelta import relativedelta
 from .serializers import (
     SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
     CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
-    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer
+    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer, DashboardResponseSerializer
 )
 
 import cloudinary.uploader
@@ -594,35 +594,8 @@ class GroupRequestActionView(APIView):
                 "growth percentage compared to last month, "
                 "and detailed cards for each active savings group the user has joined.",
     tags=['User Dashboard'],
-    response_serializers={
-        200: GroupDashboardCardSerializer(many=True)
-    },
     responses={
-        200: {
-            'type': 'object',
-            'properties': {
-                'total_savings': {
-                    'type': 'number',
-                    'format': 'float',
-                    'example': 4500.00,
-                    'description': 'Total amount saved by the user across all groups.'
-                },
-                'growth_percentage': {
-                    'type': 'number',
-                    'format': 'float',
-                    'example': 12.5
-                },
-                'growth_text': {
-                    'type': 'string',
-                    'example': '+12.5% from last month'
-                },
-                'joined_groups': {
-                    'type': 'array',
-                    'items': OpenApiTypes.OBJECT,
-                    'description': 'List of active groups the user is a member of, with card metrics.'
-                }
-            }
-        },
+        200: DashboardResponseSerializer,
         401: {'description': 'Authentication credentials were not provided.'}
     }
 )
