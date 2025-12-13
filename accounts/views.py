@@ -1,5 +1,5 @@
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
-from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership
+from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder
 from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -17,11 +17,13 @@ from rest_framework.views import APIView
 from rest_framework import generics, status
 from .permissions import IsGroupAdmin
 from django.utils import timezone
+from django.db.models import Sum
+from dateutil.relativedelta import relativedelta
 
 from .serializers import (
     SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
     CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
-    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer
+    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer
 )
 
 import cloudinary.uploader
@@ -514,7 +516,6 @@ class GroupRequestsListView(generics.ListAPIView):
 class GroupRequestActionView(APIView):
     """Endpoint for Group Admin to approve or reject a specific join request."""
     permission_classes = [IsAuthenticated, IsGroupAdmin]
-
     def get_object(self, pk):
         try:
             request_obj = GroupJoinRequest.objects.get(pk=pk)
@@ -522,68 +523,208 @@ class GroupRequestActionView(APIView):
             return request_obj
         except GroupJoinRequest.DoesNotExist:
             raise status.HTTP_404_NOT_FOUND
-
     @transaction.atomic
     def post(self, request, pk):
         try:
             request_obj = GroupJoinRequest.objects.select_related('group__admin').get(pk=pk)
         except GroupJoinRequest.DoesNotExist:
             return Response({"error": "Join request not found."}, status=status.HTTP_404_NOT_FOUND)
-
         if request_obj.group.admin != request.user:
             return Response({'detail': 'You are not authorized to handle this request.'},
                             status=status.HTTP_403_FORBIDDEN)
-
         # Validation of input action
         serializer = GroupJoinActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         action = serializer.validated_data['action']
-
         # Status Check
         if request_obj.status != 'pending':
             return Response({"error": f"Request is already {request_obj.status}."},
                             status=status.HTTP_400_BAD_REQUEST)
-
         if action == 'approve':
             group = request_obj.group
-
             # Check if group is full
             if group.current_members >= group.expected_members:
                 return Response({'error': 'Cannot approve. Group is already full.'},
                                 status=status.HTTP_400_BAD_REQUEST)
-
             try:
                 GroupMembership.objects.create(user=request_obj.user, group=group)
-
                 # Increment group member count
                 group.current_members += 1
                 group.save(update_fields=['current_members'])
-
                 request_obj.status = 'approved'
                 request_obj.handled_by = request.user
                 request_obj.handled_at = timezone.now()
                 request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
-
                 send_group_join_response_email_async.delay(pk, 'approved')
-
                 message = "User approved and added to the group successfully."
+
+                # Auto-start logic: If group is now full and active, set start_date and generate payout order
+                if group.status == 'active' and group.current_members >= group.expected_members and not group.start_date:
+                    group.start_date = timezone.now().date()
+                    group.save(update_fields=['start_date'])
+
+                    # Generate payout order based on join order (earliest first)
+                    memberships = GroupMembership.objects.filter(group=group).order_by('joined_at')
+                    for pos, membership in enumerate(memberships, start=1):
+                        PayoutOrder.objects.get_or_create(
+                            group=group,
+                            membership=membership,
+                            defaults={'position': pos}
+                        )
+                    message += " Group is now full and has been automatically started."
 
             except IntegrityError:
                 return Response({"error": "User is already a confirmed member of this group."},
                                 status=status.HTTP_400_BAD_REQUEST)
-
         elif action == 'reject':
             request_obj.status = 'rejected'
             request_obj.handled_by = request.user
             request_obj.handled_at = timezone.now()
             request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
-
             send_group_join_response_email_async.delay(pk, 'rejected')
-
             message = "User request has been rejected."
-
         else:
             message = "Invalid action."
             return Response({"error": message}, status=status.HTTP_400_BAD_REQUEST)
-
         return Response({"message": message}, status=status.HTTP_200_OK)
+
+@extend_schema(
+    description="Retrieves the authenticated user's personalized dashboard: "
+                "total savings from all contributions across groups, "
+                "growth percentage compared to last month, "
+                "and detailed cards for each active savings group the user has joined.",
+    tags=['User Dashboard'],
+    responses={
+        200: {
+            'type': 'object',
+            'properties': {
+                'total_savings': {
+                    'type': 'number',
+                    'format': 'float',
+                    'example': 4500.00,
+                    'description': 'Total amount saved by the user across all groups.'
+                },
+                'growth_percentage': {
+                    'type': 'number',
+                    'format': 'float',
+                    'example': 12.5
+                },
+                'growth_text': {
+                    'type': 'string',
+                    'example': '+12.5% from last month'
+                },
+                'joined_groups': {
+                    'type': 'array',
+                    'items': {'$ref': '#/components/schemas/GroupDashboardCard'},
+                    'description': 'List of active groups the user is a member of, with card metrics.'
+                }
+            }
+        },
+        401: {'description': 'Authentication credentials were not provided.'}
+    }
+)
+class DashboardView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        memberships = GroupMembership.objects.filter(user=user).select_related('group')
+
+        # Total savings: all user's contributions across all groups
+        total_savings = user.memberships.annotate(
+            contrib_sum=Sum('contributions__amount')
+        ).aggregate(grand_total=Sum('contrib_sum'))['grand_total'] or 0
+
+        # Growth % compared to last period
+        one_month_ago = timezone.now() - relativedelta(months=1)
+        previous_period_savings = Contribution.objects.filter(
+            membership__user=user,
+            paid_at__lt=one_month_ago
+        ).aggregate(total=Sum('amount'))['total'] or 0
+
+        if previous_period_savings > 0:
+            growth_percentage = ((total_savings - previous_period_savings) / previous_period_savings) * 100
+        else:
+            growth_percentage = 100 if total_savings > 0 else 0
+
+        # Groups cards
+        groups = [m.group for m in memberships if m.group.status == 'active']
+        groups_serializer = GroupDashboardCardSerializer(
+            groups, many=True, context={'request': request}
+        )
+
+        return Response({
+            "total_savings": float(total_savings),
+            "growth_percentage": round(growth_percentage, 1),
+            "growth_text": f"{ '+' if growth_percentage >= 0 else '' }{round(growth_percentage, 1)}% from last month",
+            "joined_groups": groups_serializer.data
+        })
+
+@extend_schema(
+    description="Manually record a contribution for the current cycle in an active savings group. "
+                "The user must be a member. Only one contribution per cycle is allowed. "
+                "(Future: This will be secured and verified via Paystack/Hubtel webhook after payment initialization.)",
+    tags=['Savings Groups'],
+    responses={
+        201: {
+            'type': 'object',
+            'properties': {
+                'message': {'type': 'string', 'example': 'Contribution recorded successfully'},
+                'contribution_id': {'type': 'integer', 'example': 42},
+                'amount': {'type': 'number', 'format': 'float', 'example': 200.00},
+                'cycle': {'type': 'integer', 'example': 1}
+            }
+        },
+        400: {'description': 'Already contributed in this cycle or invalid data.'},
+        404: {'description': 'Group not found, not active, or user not a member.'},
+        401: {'description': 'Authentication required.'}
+    }
+)
+class ContributeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, group_id):
+        try:
+            group = SavingsGroup.objects.get(
+                id=group_id,
+                status='active'
+            )
+            membership = GroupMembership.objects.get(
+                user=request.user,
+                group=group
+            )
+        except SavingsGroup.DoesNotExist:
+            return Response(
+                {"error": "Group not found or not active"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except GroupMembership.DoesNotExist:
+            return Response(
+                {"error": "You are not a member of this group"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        current_cycle = group.current_cycle_number
+        if Contribution.objects.filter(
+            membership=membership,
+            cycle_number=current_cycle
+        ).exists():
+            return Response(
+                {"error": "You have already contributed for this cycle"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Record manual contribution (full amount) for now
+        contribution = Contribution.objects.create(
+            membership=membership,
+            amount=group.contribution_amount,
+            cycle_number=current_cycle,
+            is_verified=True  # Manual now; webhook later
+        )
+
+        return Response({
+            "message": "Contribution recorded successfully",
+            "contribution_id": contribution.id,
+            "amount": float(contribution.amount),
+            "cycle": current_cycle
+        }, status=status.HTTP_201_CREATED)
