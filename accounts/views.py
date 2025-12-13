@@ -615,7 +615,7 @@ class GroupRequestActionView(APIView):
                 },
                 'joined_groups': {
                     'type': 'array',
-                    'items': {'$ref': '#/components/schemas/GroupDashboardCard'},
+                    'items': GroupDashboardCardSerializer,
                     'description': 'List of active groups the user is a member of, with card metrics.'
                 }
             }
