@@ -1,4 +1,4 @@
-from .views import CreateSavingsGroupView, MyGroupsListView, GroupDetailView, AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView
+from .views import ContributeView, CreateSavingsGroupView, DashboardView, MyGroupsListView, GroupDetailView, AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView
 
 from django.urls import path
 
@@ -12,4 +12,8 @@ urlpatterns = [
     path('groups/<int:group_id>/request_join/', GroupJoinRequestView.as_view(), name='group-request-join'),
     path('groups/<int:group_id>/requests/', GroupRequestsListView.as_view(), name='group-requests-list'),
     path('groups/requests/<int:pk>/action/', GroupRequestActionView.as_view(), name='group-request-action'),
+    path('groups/<int:group_id>/contribute/', ContributeView.as_view(), name='group-contribute'),
+
+    # Dashboard endpoint
+    path('dashboard/', DashboardView.as_view(), name='dashboard'),
 ]

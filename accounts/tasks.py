@@ -5,6 +5,8 @@ from django.template.loader import render_to_string
 from django.contrib.sites.models import Site
 from django.urls import NoReverseMatch, reverse
 from celery import shared_task
+from django.utils import timezone
+from .models import SavingsGroup, Contribution, PayoutOrder
 
 # Dawurobo API constants
 DAWUROBO_BASE = "https://devs.sms.api.dawurobo.com/v1/otp"
@@ -227,4 +229,122 @@ def send_group_join_response_email_async(request_id: int, action: str):
         return True
     except Exception as e:
         print(f"EMAIL SEND ERROR for Request ID {request_id}: {e}")
+        return False
+
+@shared_task
+def process_daily_payouts():
+    today = timezone.now().date()
+    active_groups = SavingsGroup.objects.filter(
+        status='active',
+        start_date__lte=today
+    )
+    for group in active_groups:
+        days_since_start = (today - group.start_date).days
+        if days_since_start % group.payout_interval_days != 0:
+            continue
+        current_cycle = group.current_cycle_number
+
+        # Verify all contributions for this cycle
+        expected_contributions = group.expected_members
+        verified_contributions = Contribution.objects.filter(
+            membership__group=group,
+            cycle_number=current_cycle,
+            is_verified=True
+        ).count()
+        if verified_contributions < expected_contributions:
+            send_mail(
+                subject=f"Incomplete Contributions for {group.group_name}",
+                message=f"Cycle {current_cycle} in {group.group_name} has only {verified_contributions}/{expected_contributions} verified contributions. Payout skipped.",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[group.admin.email]
+            )
+            continue
+
+        # Determine beneficiary (rotates through positions)
+        position = ((current_cycle - 1) % group.expected_members) + 1
+        try:
+            payout_order = PayoutOrder.objects.get(
+                group=group,
+                position=position
+            )
+            beneficiary = payout_order.membership.user
+        except PayoutOrder.DoesNotExist:
+            continue
+        # Calculate pot
+        total_pot = group.total_pot_per_cycle
+
+        # Trigger disbursement (manual email for now. I'll use Paystack/Hubtel API call later)
+        send_payout_notification_email_async.delay(
+            beneficiary_id=beneficiary.id,
+            group_id=group.id,
+            cycle=current_cycle,
+            amount=float(total_pot)
+        )
+        print(f"Payout processed for {beneficiary.email} in {group.group_name} - Cycle {current_cycle}")
+
+@shared_task
+def send_payout_notification_email_async(
+    beneficiary_id: int,
+    group_id: int,
+    cycle: int,
+    amount: float
+) -> bool:
+    """
+    Celery task to send a payout notification email to the beneficiary.
+    """
+    try:
+        from .models import SavingsGroup, User
+        beneficiary = User.objects.select_related('profile').get(pk=beneficiary_id)
+        group = SavingsGroup.objects.get(pk=group_id)
+    except (User.DoesNotExist, SavingsGroup.DoesNotExist):
+        print(f"ERROR: User ID {beneficiary_id} or Group ID {group_id} not found.")
+        return False
+
+    beneficiary_name = beneficiary.profile.full_name
+    group_name = group.group_name.strip('*').strip()
+    momo_number = str(beneficiary.profile.momo_number)
+    formatted_amount = f"₵{amount:,.2f}"
+
+    current_site = Site.objects.get_current()
+    protocol = "http" if settings.DEBUG else "https"
+    try:
+        relative_url = reverse('dashboard')
+    except NoReverseMatch:
+        print("URL Reverse Match Error: Check URL configuration for 'dashboard'")
+        relative_url = reverse('group-detail', kwargs={'id': group.id})
+    full_dashboard_url = f"{protocol}://{current_site.domain}{relative_url}"
+
+    # Render Email Content
+    context = {
+        'beneficiary_name': beneficiary_name,
+        'group_name': group_name,
+        'cycle': cycle,
+        'amount': formatted_amount,
+        'momo_number': momo_number,
+        'dashboard_url': full_dashboard_url,
+    }
+    template_name = 'emails/payout_notification.html'
+    subject = f"🎉 Payout Processed from '{group_name}'!"
+    email_html_content = render_to_string(template_name, context)
+    email_text_content = (
+        f"Congratulations, {beneficiary_name}! Your payout of {formatted_amount} "
+        f"for cycle {cycle} in '{group_name}' has been processed. "
+        f"It will be sent to your MoMo account: {momo_number}. "
+        f"View your dashboard: {full_dashboard_url}"
+    )
+
+    # Send Email
+    try:
+        send_mail(
+            subject=subject,
+            message=email_text_content,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[beneficiary.email],
+            html_message=email_html_content,
+            fail_silently=False,
+        )
+        print(f"Payout notification email sent to {beneficiary.email} for Group ID {group.id}")
+        return True
+    except Exception as e:
+        print(f"EMAIL SEND ERROR for Beneficiary ID {beneficiary_id}: {e}")
         return False

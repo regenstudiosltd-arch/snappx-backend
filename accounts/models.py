@@ -5,6 +5,11 @@ from django.core.validators import RegexValidator
 from cloudinary.models import CloudinaryField
 from django.db import models
 import os
+from django.core.validators import MinValueValidator
+from django.db.models import Sum
+from dateutil.relativedelta import relativedelta
+import datetime
+from django.utils import timezone
 
 
 class User(AbstractUser):
@@ -101,6 +106,64 @@ class SavingsGroup(models.Model):
         ('rejected', 'Rejected'),
         ('suspended', 'Suspended'),
     )
+
+    start_date = models.DateField(
+        null=True, blank=True,
+        help_text="Date when the group officially starts contributing (set when activated)"
+    )
+
+    payout_interval_days = models.PositiveIntegerField(
+        default=30,
+        help_text="Computed from frequency: daily=1, weekly=7, monthly≈30"
+    )
+
+    def save(self, *args, **kwargs):
+        if self.frequency == 'daily':
+            self.payout_interval_days = 1
+        elif self.frequency == 'weekly':
+            self.payout_interval_days = 7
+        elif self.frequency == 'monthly':
+            self.payout_interval_days = 30
+        super().save(*args, **kwargs)
+
+    @property
+    def total_pot_per_cycle(self):
+        return self.contribution_amount * self.expected_members
+
+    @property
+    def next_payout_date(self):
+        if not self.start_date:
+            return None
+        today = timezone.now().date()
+        days_since_start = (today - self.start_date).days
+        cycle_length = self.payout_interval_days
+
+        # Next payout is at the end of the current cycle
+        days_into_current_cycle = days_since_start % cycle_length
+        days_to_next_payout = cycle_length - days_into_current_cycle
+
+        # If exactly on payout day, next one is in full cycle
+        if days_to_next_payout == 0:
+            days_to_next_payout = cycle_length
+
+        return today + datetime.timedelta(days=days_to_next_payout)
+
+    @property
+    def days_until_next_payout(self):
+        if not self.next_payout_date:
+            return None
+        today = timezone.now().date()
+        days_left = (self.next_payout_date - today).days
+        return days_left if days_left > 0 else 0  # today = 0, not negative
+
+    @property
+    def current_cycle_number(self):
+        if not self.start_date:
+            return 0
+        # Use timezone.now() from django.utils
+        days_since_start = (timezone.now().date() - self.start_date).days
+        return (days_since_start // self.payout_interval_days) + 1
+
 
     name = models.CharField(max_length=255)
     admin = models.ForeignKey(User, on_delete=models.PROTECT, related_name='admin_of_groups')
@@ -206,3 +269,33 @@ class GroupMembership(models.Model):
 
     def __str__(self):
         return f"{self.user.email} is a member of {self.group.group_name}"
+
+class PayoutOrder(models.Model):
+    """Defines the rotational payout order. Admin sets this after group is full/active."""
+    group = models.ForeignKey(
+        SavingsGroup,
+        on_delete=models.CASCADE,
+        related_name='payout_orders'
+    )
+    membership = models.ForeignKey(
+        GroupMembership,
+        on_delete=models.CASCADE
+    )
+    position = models.PositiveIntegerField(
+        help_text="1 = first to receive payout, 2 = second, etc."
+    )
+
+    class Meta:
+        unique_together = ('group', 'membership')
+        unique_together = ('group', 'position')
+        ordering = ['position']
+
+class Contribution(models.Model):
+    membership = models.ForeignKey(GroupMembership, on_delete=models.PROTECT, related_name='contributions')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
+    cycle_number = models.PositiveIntegerField()
+    paid_at = models.DateTimeField(auto_now_add=True)
+    is_verified = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ('membership', 'cycle_number')
