@@ -1,4 +1,4 @@
-from .models import GroupAdminKYC, SavingsGroup, GroupJoinRequest, GroupMembership
+from .models import GroupAdminKYC, PayoutOrder, SavingsGroup, GroupJoinRequest, GroupMembership
 from django.utils.html import format_html
 from django.utils import timezone
 from django.contrib import admin
@@ -108,7 +108,22 @@ class SavingsGroupAdmin(admin.ModelAdmin):
             group.admin.kyc.verified_by = request.user
             group.admin.kyc.verified_at = timezone.now()
             group.admin.kyc.save()
-    approve_groups.short_description = "Approve selected groups"
+
+            # Activation logic if group is full
+            if group.current_members >= group.expected_members and not group.start_date:
+                group.start_date = timezone.now().date()
+                group.save(update_fields=['start_date'])
+
+                # Generate payout order based on join order (earliest first)
+                memberships = group.members.order_by('joined_at')
+                for pos, membership in enumerate(memberships, start=1):
+                    PayoutOrder.objects.create(
+                        group=group,
+                        membership=membership,
+                        position=pos
+                    )
+
+    approve_groups.short_description = "Approve and activate selected groups (if full)"
 
     def suspend_groups(self, request, queryset):
         queryset.update(status='suspended')
