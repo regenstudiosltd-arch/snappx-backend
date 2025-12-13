@@ -665,6 +665,7 @@ class DashboardView(APIView):
                 "The user must be a member. Only one contribution per cycle is allowed. "
                 "(Future: This will be secured and verified via Paystack/Hubtel webhook after payment initialization.)",
     tags=['Savings Groups'],
+    request=None,
     responses={
         201: {
             'type': 'object',
