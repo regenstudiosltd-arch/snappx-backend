@@ -1,4 +1,4 @@
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, OpenApiTypes
 from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder
 from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -594,6 +594,9 @@ class GroupRequestActionView(APIView):
                 "growth percentage compared to last month, "
                 "and detailed cards for each active savings group the user has joined.",
     tags=['User Dashboard'],
+    response_serializers={
+        200: GroupDashboardCardSerializer(many=True)
+    },
     responses={
         200: {
             'type': 'object',
@@ -615,7 +618,7 @@ class GroupRequestActionView(APIView):
                 },
                 'joined_groups': {
                     'type': 'array',
-                    'items': GroupDashboardCardSerializer,
+                    'items': OpenApiTypes.OBJECT,
                     'description': 'List of active groups the user is a member of, with card metrics.'
                 }
             }
