@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from decouple import config
 from pathlib import Path
+from celery.schedules import crontab
 
 # Load .env file
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -238,3 +239,28 @@ CELERY_TIMEZONE = 'Africa/Accra'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
+
+# # Periodic Task Scheduling
+# CELERY_BEAT_SCHEDULE = {
+#     'process-daily-payouts': {
+#         'task': 'accounts.tasks.process_daily_payouts',
+#         # Run daily at midnight
+#         'schedule': crontab(minute=0, hour=0),
+#     },
+# }
+
+CELERY_BEAT_SCHEDULE = {
+    'process-daily-payouts': {
+        'task': 'accounts.tasks.process_daily_payouts',
+        'schedule': timedelta(minutes=3),
+        'options': {'queue': 'default'},
+    },
+}
+
+
+ENVIRONMENT = config("ENVIRONMENT", default="development")
+
+if ENVIRONMENT == "production":
+    SITE_URL = config("SITE_URL")
+else:
+    SITE_URL = "http://127.0.0.1:8000"
