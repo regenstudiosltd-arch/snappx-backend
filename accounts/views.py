@@ -1,4 +1,4 @@
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, OpenApiTypes
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, inline_serializer, OpenApiTypes
 from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder,  SavingsGoal, GoalContribution
 from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -712,15 +712,14 @@ class ContributeView(APIView):
 @extend_schema(
     request=SavingsGoalCreateSerializer,
     responses={
-        201: {
-            'type': 'object',
-            'properties': {
-                'success': {'type': 'boolean'},
-                'message': {'type': 'string'},
+        201: inline_serializer(
+            name='CreateGoalResponse',
+            fields={
+                'success': rest_serializers.BooleanField(default=True),
+                'message': rest_serializers.CharField(),
                 'goal': SavingsGoalSerializer(),
             }
-        },
-        400: {'description': 'Validation error'},
+        )
     },
     description="Allows authenticated users to create a new personal savings goal.",
     tags=['Savings Goals']
