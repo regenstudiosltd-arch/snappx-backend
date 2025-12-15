@@ -1,13 +1,15 @@
+from time import timezone
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from .models import GroupAdminKYC, Profile, SavingsGroup, GroupJoinRequest, GroupMembership, Contribution
+from .models import GroupAdminKYC, Profile, SavingsGroup, GroupJoinRequest, GroupMembership, Contribution, SavingsGoal, GoalContribution
 from rest_framework_simplejwt.tokens import RefreshToken
-from .models import GroupAdminKYC, SavingsGroup
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from django.conf import settings
 from django.db.models import Sum
 from drf_spectacular.utils import extend_schema_field, OpenApiTypes
+from decimal import Decimal
+from django.utils import timezone
 
 User = get_user_model()
 
@@ -347,3 +349,122 @@ class DashboardResponseSerializer(serializers.Serializer):
         many=True,
         help_text='List of active groups the authenticated user is a member of.'
     )
+
+class SavingsGoalCreateSerializer(serializers.ModelSerializer):
+    """
+    Serializer for creating a new personal savings goal.
+    """
+    class Meta:
+        model = SavingsGoal
+        fields = [
+            'name', 'target_amount', 'regular_contribution', 'target_date','frequency']
+
+    def validate(self, data):
+        """
+        Additional validation: ensure target date is in the future.
+        """
+        if data['target_date'] < timezone.now().date():
+            raise serializers.ValidationError("Target date must be in the future.")
+        if data['target_amount'] <= 0:
+            raise serializers.ValidationError("Target amount must be greater than zero.")
+        if data['regular_contribution'] <= 0:
+            raise serializers.ValidationError("Regular contribution must be greater than zero.")
+        return data
+
+    def create(self, validated_data):
+        user = self.context['request'].user
+        goal = SavingsGoal.objects.create(user=user, **validated_data)
+        return goal
+
+class SavingsGoalSerializer(serializers.ModelSerializer):
+    """
+    Base serializer for SavingsGoal with computed fields used in lists and details.
+    """
+    current_saved = serializers.SerializerMethodField()
+    progress_percentage = serializers.SerializerMethodField()
+    days_left = serializers.SerializerMethodField()
+    contribution_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SavingsGoal
+        fields = [
+            'id', 'name', 'target_amount', 'regular_contribution', 'frequency',
+            'target_date', 'created_at', 'current_saved', 'progress_percentage',
+            'days_left', 'contribution_display'
+        ]
+        read_only_fields = ['created_at', 'current_saved', 'progress_percentage', 'days_left']
+
+    @extend_schema_field(OpenApiTypes.FLOAT)
+    def get_current_saved(self, obj):
+        return float(obj.current_saved)
+
+    @extend_schema_field(OpenApiTypes.FLOAT)
+    def get_progress_percentage(self, obj):
+        return round(obj.progress_percentage, 1)
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_days_left(self, obj):
+        return obj.days_left
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_contribution_display(self, obj):
+        freq_map = dict(SavingsGoal.FREQUENCY_CHOICES)
+        frequency_label = freq_map.get(obj.frequency, obj.frequency).capitalize()
+        return f"₵{obj.regular_contribution} {frequency_label}"
+
+class GoalDashboardCardSerializer(SavingsGoalSerializer):
+    """
+    Serializer used specifically for the individual goals.
+    It inherits all fields and methods from SavingsGoalSerializer, providing:
+      - goal name
+      - current_saved of target_amount (e.g., ₵3,200 of ₵5,000)
+      - contribution_display (e.g., ₵500 Monthly)
+      - progress_percentage (for progress bar)
+      - days_left (e.g., "6 days" or "Overdue")
+    """
+    pass
+
+class GoalsDashboardResponseSerializer(serializers.Serializer):
+    """
+    Top-level response serializer for the /goals/dashboard/ endpoint.
+    Defines the structure of the overview card + list of goal cards.
+    """
+    total_target = serializers.FloatField(
+        help_text="Sum of target_amount across all user's goals."
+    )
+    total_saved = serializers.FloatField(
+        help_text="Sum of current_saved across all user's goals."
+    )
+    overall_progress = serializers.FloatField(
+        help_text="Overall progress percentage (total_saved / total_target × 100)."
+    )
+    active_goals_count = serializers.IntegerField(
+        help_text="Number of goals that are still active (not completed and not overdue if you prefer, but here includes overdue but incomplete)."
+    )
+    goals = GoalDashboardCardSerializer(
+        many=True,
+        help_text="Detailed list of all the user's savings goals as cards."
+    )
+
+
+class SavingsGoalUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SavingsGoal
+        fields = [
+            'name', 'target_amount', 'regular_contribution',
+            'target_date', 'frequency'
+        ]
+        partial = True
+
+    def validate(self, data):
+        instance = self.instance
+        if 'target_date' in data and data['target_date'] < timezone.now().date():
+            raise serializers.ValidationError("Target date must be in the future.")
+        if 'target_amount' in data and data['target_amount'] <= 0:
+            raise serializers.ValidationError("Target amount must be greater than zero.")
+        if 'regular_contribution' in data and data['regular_contribution'] <= 0:
+            raise serializers.ValidationError("Regular contribution must be greater than zero.")
+        # Prevent reducing target below current saved
+        if 'target_amount' in data and instance and data['target_amount'] < instance.current_saved:
+            raise serializers.ValidationError("Cannot set target below current saved amount.")
+        return data

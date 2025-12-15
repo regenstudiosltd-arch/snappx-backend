@@ -1,4 +1,4 @@
-from .views import ContributeView, CreateSavingsGroupView, DashboardView, MyGroupsListView, GroupDetailView, AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView
+from .views import ContributeView, CreateSavingsGoalView, CreateSavingsGroupView, DashboardView, MyGroupsListView, GroupDetailView, AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView, GoalsDashboardView, GoalDetailView,ContributeToGoalView
 
 from django.urls import path
 
@@ -16,4 +16,10 @@ urlpatterns = [
 
     # Dashboard endpoint
     path('dashboard/', DashboardView.as_view(), name='dashboard'),
+
+    # Goals endpoint
+    path('goals/create/', CreateSavingsGoalView.as_view(), name='create-savings-goal'),
+    path('goals/dashboard/', GoalsDashboardView.as_view(), name='goals-dashboard'),
+    path('goals/<int:goal_id>/contribute/', ContributeToGoalView.as_view(), name='goal-contribute'),
+    path('goals/<int:id>/', GoalDetailView.as_view(), name='goal-detail'),
 ]

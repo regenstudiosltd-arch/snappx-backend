@@ -1,4 +1,4 @@
-from .models import GroupAdminKYC, PayoutOrder, SavingsGroup, GroupJoinRequest, GroupMembership
+from .models import GoalContribution, GroupAdminKYC, PayoutOrder, SavingsGoal, SavingsGroup, GroupJoinRequest, GroupMembership
 from django.utils.html import format_html
 from django.utils import timezone
 from django.contrib import admin
@@ -147,3 +147,14 @@ class GroupMembershipAdmin(admin.ModelAdmin):
     list_filter = ['joined_at']
     search_fields = ['user__email', 'group__group_name']
     readonly_fields = ['user', 'group', 'joined_at']
+@admin.register(SavingsGoal)
+class SavingsGoalAdmin(admin.ModelAdmin):
+    list_display = ['name', 'user', 'target_amount', 'frequency', 'target_date', 'created_at']
+    list_filter = ['frequency', 'created_at']
+    search_fields = ['name', 'user__email']
+
+@admin.register(GoalContribution)
+class GoalContributionAdmin(admin.ModelAdmin):
+    list_display = ['goal', 'amount', 'paid_at', 'is_verified']
+    list_filter = ['paid_at', 'is_verified']
+    search_fields = ['goal__name']

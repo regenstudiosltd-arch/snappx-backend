@@ -1,12 +1,17 @@
 import requests
+from decimal import Decimal
 from django.conf import settings
 from django.core.mail import send_mail
 from django.template.loader import render_to_string
 from django.contrib.sites.models import Site
 from django.urls import NoReverseMatch, reverse
+from django.db import models
+from django.utils import timezone
+from datetime import timedelta
+from django.db.models import Sum, Q
 from celery import shared_task
 from django.utils import timezone
-from .models import SavingsGroup, Contribution, PayoutOrder
+from .models import SavingsGroup, Contribution, PayoutOrder, SavingsGoal
 
 # Dawurobo API constants
 DAWUROBO_BASE = "https://devs.sms.api.dawurobo.com/v1/otp"
@@ -348,3 +353,77 @@ def send_payout_notification_email_async(
     except Exception as e:
         print(f"EMAIL SEND ERROR for Beneficiary ID {beneficiary_id}: {e}")
         return False
+
+@shared_task
+def send_goal_reminders():
+    """
+    Celery task to check all savings goals and send reminder emails if contribution is due.
+    Runs daily; skips if reminded recently (within 24h).
+    """
+    today = timezone.now().date()
+    # Calculate current_saved for each goal
+    goals = SavingsGoal.objects.annotate(
+        total_saved=Sum('contributions__amount')
+    ).filter(
+        total_saved__lt=models.F('target_amount'),
+        total_saved__isnull=False
+    ).select_related('user__profile')
+
+    for goal in goals:
+        current_saved = goal.total_saved or Decimal('0.00')
+
+        if not goal.is_due:
+            continue
+
+        if goal.last_reminded_at and (timezone.now() - goal.last_reminded_at) < timedelta(days=1):
+            continue
+
+        user = goal.user
+        user_name = user.profile.full_name
+        current_site = Site.objects.get_current()
+        protocol = "http" if settings.DEBUG else "https"
+        dashboard_url = f"{protocol}://{current_site.domain}{reverse('goals-dashboard')}"
+        progress_percentage = round((float(current_saved) / float(goal.target_amount)) * 100, 1) if goal.target_amount > 0 else 0.0
+
+        context = {
+            'user_name': user_name,
+            'goal_name': goal.name,
+            'contribution_amount': f"₵{goal.regular_contribution:,.2f}",
+            'frequency': goal.frequency,  # raw for |capfirst in HTML
+            'current_saved': f"₵{current_saved:,.2f}",
+            'target_amount': f"₵{goal.target_amount:,.2f}",
+            'progress_percentage': progress_percentage,
+            'target_date': goal.target_date.strftime('%B %d, %Y'),
+            'dashboard_url': dashboard_url,
+        }
+
+        subject = f"⏰ Reminder: Time for Your {goal.get_frequency_display()} Contribution to '{goal.name}'"
+        html_content = render_to_string('emails/goal_reminder.html', context)
+        text_content = (
+            f"Hi {user_name},\n\n"
+            f"Just a friendly reminder that it's time for your {goal.get_frequency_display()} contribution to your \"{goal.name}\" goal.\n\n"
+            f"Goal: {goal.name}\n"
+            f"Amount Due: ₵{goal.regular_contribution:,.2f}\n"
+            f"Frequency: {goal.get_frequency_display()}\n"
+            f"Progress: ₵{current_saved:,.2f} / ₵{goal.target_amount:,.2f} ({progress_percentage}%)\n" # NOTE THE VARIABLE USE HERE
+            f"Target Date: {goal.target_date.strftime('%B %d, %Y')}\n\n"
+            f"Log in to your dashboard to make your contribution and stay on track!\n"
+            f"{dashboard_url}\n\n"
+            f"You're doing great—keep up the momentum!\n\n"
+            f"The SnappX Team"
+        )
+
+        try:
+            send_mail(
+                subject=subject,
+                message=text_content,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                html_message=html_content,
+                fail_silently=False,
+            )
+            goal.last_reminded_at = timezone.now()
+            goal.save(update_fields=['last_reminded_at'])
+            print(f"Reminder sent to {user.email} for goal {goal.id}")
+        except Exception as e:
+            print(f"Failed to send reminder for goal {goal.id}: {e}")

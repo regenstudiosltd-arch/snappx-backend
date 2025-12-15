@@ -1,3 +1,4 @@
+from decimal import Decimal
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
@@ -299,3 +300,86 @@ class Contribution(models.Model):
 
     class Meta:
         unique_together = ('membership', 'cycle_number')
+
+
+class SavingsGoal(models.Model):
+    FREQUENCY_CHOICES = (
+        ('daily', 'Daily'),
+        ('weekly', 'Weekly'),
+        ('monthly', 'Monthly'),
+    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='savings_goals')
+    name = models.CharField(max_length=255)
+    target_amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    regular_contribution = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    target_date = models.DateField()
+    frequency = models.CharField(max_length=20, choices=FREQUENCY_CHOICES)
+    last_contribution_date = models.DateField(null=True, blank=True)  # Updated on contribution
+    last_reminded_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} for {self.user.email}"
+
+    def clean(self):
+        if self.target_date < timezone.now().date():
+            raise ValidationError("Target date must be in the future.")
+        if self.target_amount <= 0:
+            raise ValidationError("Target amount must be positive.")
+
+    @property
+    def current_saved(self):
+        total = self.contributions.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        return total
+
+    @property
+    def progress_percentage(self):
+        if self.target_amount == 0:
+            return 0.0
+        return float((self.current_saved / self.target_amount) * 100)
+
+    @property
+    def days_left(self):
+        today = timezone.now().date()
+        delta = self.target_date - today
+        if delta.days < 0:
+            return "Overdue"
+        elif delta.days == 0:
+            return "Due today"
+        else:
+            return f"{delta.days} days"
+
+    @property
+    def is_due(self):
+        if not self.last_contribution_date:
+            # First contribution is always due
+            return True
+
+        today = timezone.now().date()
+        last_date = self.last_contribution_date
+        delta_days = (today - last_date).days
+
+        if self.frequency == 'daily':
+            return delta_days >= 1
+        elif self.frequency == 'weekly':
+            return delta_days >= 7
+        elif self.frequency == 'monthly':
+            next_due = last_date + relativedelta(months=1)
+            return today >= next_due
+        return False
+
+    @property
+    def is_active(self):
+        return self.current_saved < self.target_amount and self.target_date >= timezone.now().date()
+
+class GoalContribution(models.Model):
+    goal = models.ForeignKey(SavingsGoal, on_delete=models.CASCADE, related_name='contributions')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
+    paid_at = models.DateTimeField(auto_now_add=True)
+    is_verified = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ['-paid_at']
