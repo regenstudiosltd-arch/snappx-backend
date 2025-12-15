@@ -1,5 +1,5 @@
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, OpenApiTypes
-from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder
+from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder,  SavingsGoal, GoalContribution
 from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -19,11 +19,14 @@ from .permissions import IsGroupAdmin
 from django.utils import timezone
 from django.db.models import Sum
 from dateutil.relativedelta import relativedelta
+from decimal import Decimal
+from rest_framework.generics import RetrieveUpdateDestroyAPIView
 
 from .serializers import (
-    SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
+    GoalDashboardCardSerializer, SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
     CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
-    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer, DashboardResponseSerializer
+    FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer,
+    DashboardResponseSerializer, SavingsGoalCreateSerializer, GoalsDashboardResponseSerializer, SavingsGoalSerializer, SavingsGoalUpdateSerializer
 )
 
 import cloudinary.uploader
@@ -705,3 +708,192 @@ class ContributeView(APIView):
             "amount": float(contribution.amount),
             "cycle": current_cycle
         }, status=status.HTTP_201_CREATED)
+
+@extend_schema(
+    request=SavingsGoalCreateSerializer,
+    responses={
+        201: {
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'message': {'type': 'string'},
+                'goal': SavingsGoalSerializer(),
+            }
+        },
+        400: {'description': 'Validation error'},
+    },
+    description="Allows authenticated users to create a new personal savings goal.",
+    tags=['Savings Goals']
+)
+class CreateSavingsGoalView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = SavingsGoalCreateSerializer(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            goal = serializer.save()
+            return Response({
+                "success": True,
+                "message": "Savings goal created successfully!",
+                "goal": SavingsGoalSerializer(goal).data
+            }, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.error(f"Goal creation failed: {e}")
+            return Response({
+                "error": "Failed to create goal. Please try again."
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@extend_schema(
+    description="Retrieves the authenticated user's personalized goals dashboard: "
+                "overall totals, progress, active count, and detailed cards for each savings goal.",
+    tags=['Savings Goals'],
+    responses={
+        200: GoalsDashboardResponseSerializer,
+        401: {'description': 'Authentication required.'}
+    }
+)
+class GoalsDashboardView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        goals = SavingsGoal.objects.filter(user=user)
+
+        # Overview calculations
+        total_target = goals.aggregate(total=Sum('target_amount'))['total'] or Decimal('0.00')
+        total_saved = sum(goal.current_saved for goal in goals)
+        overall_progress = (float(total_saved) / float(total_target) * 100) if total_target > 0 else 0.0
+        active_goals_count = goals.filter(
+            id__in=[g.id for g in goals if g.is_active]
+        ).count()
+
+        # Serialize goals
+        goals_serializer = GoalDashboardCardSerializer(goals, many=True)
+
+        return Response({
+            "total_target": float(total_target),
+            "total_saved": float(total_saved),
+            "overall_progress": round(overall_progress, 1),
+            "active_goals_count": active_goals_count,
+            "goals": goals_serializer.data
+        })
+
+@extend_schema(
+    description="Manually record a contribution to a savings goal. "
+                "The user must own the goal. Prevents contribution if target is already reached. "
+                "(Future: Secure with Paystack/Hubtel webhook.)",
+    tags=['Savings Goals'],
+    request=None,
+    responses={
+        201: {
+            'type': 'object',
+            'properties': {
+                'message': {'type': 'string', 'example': 'Contribution recorded successfully'},
+                'contribution_id': {'type': 'integer'},
+                'amount': {'type': 'number', 'format': 'float'},
+                'new_saved': {'type': 'number', 'format': 'float'}
+            }
+        },
+        400: {'description': 'Goal already completed or invalid state.'},
+        404: {'description': 'Goal not found or not owned by user.'},
+        401: {'description': 'Authentication required.'}
+    }
+)
+class ContributeToGoalView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, goal_id):
+        try:
+            goal = SavingsGoal.objects.get(id=goal_id, user=request.user)
+        except SavingsGoal.DoesNotExist:
+            return Response(
+                {"error": "Goal not found or you do not own it."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if goal is already completed
+        current_saved = goal.current_saved
+        if current_saved >= goal.target_amount:
+            return Response(
+                {
+                    "error": "This goal has already been completed. No further contributions allowed."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        potential_new_saved = current_saved + goal.regular_contribution
+        if potential_new_saved > goal.target_amount:
+            remaining = goal.target_amount - current_saved
+            return Response(
+                {
+                    "error": f"Cannot contribute full amount. Only ₵{remaining} needed to complete goal.",
+                    "remaining_needed": float(remaining)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Record the contribution
+        contribution = GoalContribution.objects.create(
+            goal=goal,
+            amount=goal.regular_contribution,
+            # Manual now; will be False + webhook later
+            is_verified=True
+        )
+
+        goal.last_contribution_date = timezone.now().date()
+        goal.save(update_fields=['last_contribution_date'])
+
+        return Response({
+            "message": "Contribution recorded successfully",
+            "contribution_id": contribution.id,
+            "amount": float(contribution.amount),
+            "new_saved": float(goal.current_saved)
+        }, status=status.HTTP_201_CREATED)
+
+
+@extend_schema(
+    methods=['GET'],
+    responses={200: SavingsGoalSerializer},
+    description="Retrieve details of a specific savings goal owned by the user.",
+    tags=['Savings Goals']
+)
+@extend_schema(
+    methods=['PATCH'],
+    request=SavingsGoalUpdateSerializer,
+    responses={
+        200: SavingsGoalSerializer,
+        400: {'description': 'Validation error'}
+    },
+    description="Partially update a savings goal owned by the user.",
+    tags=['Savings Goals']
+)
+@extend_schema(
+    methods=['DELETE'],
+    responses={
+        204: {'description': 'Goal deleted successfully.'},
+        404: {'description': 'Goal not found or not owned.'}
+    },
+    description="Delete a savings goal owned by the user (and its contributions).",
+    tags=['Savings Goals']
+)
+class GoalDetailView(RetrieveUpdateDestroyAPIView):
+    serializer_class = SavingsGoalSerializer
+    permission_classes = [IsAuthenticated]
+    lookup_field = 'id'
+
+    def get_queryset(self):
+        return SavingsGoal.objects.filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        if self.request.method == 'PATCH':
+            return SavingsGoalUpdateSerializer
+        return super().get_serializer_class()
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        instance.delete()
