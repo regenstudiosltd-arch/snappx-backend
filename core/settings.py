@@ -161,9 +161,17 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
+# SIMPLE_JWT = {
+#     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+#     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+#     'UPDATE_LAST_LOGIN': True,
+#     'AUTH_HEADER_TYPES': ('Bearer',),
+# }
+
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=8),  # Example: 8 hours (good balance)
+    # Or timedelta(minutes=120) for 2 hours
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),  # Optional: extend refresh too
     'UPDATE_LAST_LOGIN': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
@@ -249,9 +257,22 @@ CELERY_RESULT_SERIALIZER = 'json'
 #     },
 # }
 
+# CELERY_BEAT_SCHEDULE = {
+#     'process-daily-payouts': {
+#         'task': 'accounts.tasks.process_daily_payouts',
+#         'schedule': timedelta(minutes=3),
+#         'options': {'queue': 'default'},
+#     },
+# }
+
 CELERY_BEAT_SCHEDULE = {
     'process-daily-payouts': {
         'task': 'accounts.tasks.process_daily_payouts',
+        'schedule': timedelta(minutes=3),
+        'options': {'queue': 'default'},
+    },
+    'send-goal-reminders': {
+        'task': 'accounts.tasks.send_goal_reminders',
         'schedule': timedelta(minutes=3),
         'options': {'queue': 'default'},
     },
