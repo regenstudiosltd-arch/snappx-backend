@@ -1,10 +1,15 @@
-from .views import ContributeView, CreateSavingsGoalView, CreateSavingsGroupView, DashboardView, MyGroupsListView, GroupDetailView, AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView, GoalsDashboardView, GoalDetailView,ContributeToGoalView
+from .views import(
+    ContributeView, CreateSavingsGoalView, CreateSavingsGroupView, DashboardView, GroupDetailView,
+    AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView,
+    GoalsDashboardView, GoalDetailView,ContributeToGoalView, GroupsStatsView, JoinRequestsStatsView,
+    MyJoinedGroupsListView
+)
 
 from django.urls import path
 
 urlpatterns = [
     path('groups/create/', CreateSavingsGroupView.as_view(), name='create-savings-group'),
-    path('groups/my-groups/', MyGroupsListView.as_view(), name='my-groups'),
+    path('groups/my-joined/', MyJoinedGroupsListView.as_view(), name='my-joined-groups'),
     path('groups/all/', AllGroupsListView.as_view(), name='all-groups'),
     path('groups/<int:id>/', GroupDetailView.as_view(), name='group-detail'),
 
@@ -13,6 +18,8 @@ urlpatterns = [
     path('groups/<int:group_id>/requests/', GroupRequestsListView.as_view(), name='group-requests-list'),
     path('groups/requests/<int:pk>/action/', GroupRequestActionView.as_view(), name='group-request-action'),
     path('groups/<int:group_id>/contribute/', ContributeView.as_view(), name='group-contribute'),
+    path('groups/stats/', GroupsStatsView.as_view(), name='groups-stats'),
+    path('groups/join-requests/stats/', JoinRequestsStatsView.as_view(), name='join-requests-stats'),
 
     # Dashboard endpoint
     path('dashboard/', DashboardView.as_view(), name='dashboard'),
