@@ -224,6 +224,12 @@ class GroupJoinRequest(models.Model):
         default='pending',
         db_index=True
     )
+    reason = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Optional reason provided by the user for wanting to join the group."
+    )
+
     requested_at = models.DateTimeField(auto_now_add=True)
 
     # Fields for Admin action
