@@ -21,12 +21,15 @@ from django.db.models import Sum
 from dateutil.relativedelta import relativedelta
 from decimal import Decimal
 from rest_framework.generics import RetrieveUpdateDestroyAPIView
+from rest_framework import serializers
 
 from .serializers import (
     GoalDashboardCardSerializer, SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
     CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
     FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer,
-    DashboardResponseSerializer, SavingsGoalCreateSerializer, GoalsDashboardResponseSerializer, SavingsGoalSerializer, SavingsGoalUpdateSerializer
+    DashboardResponseSerializer, SavingsGoalCreateSerializer, GoalsDashboardResponseSerializer,
+    SavingsGoalSerializer, SavingsGoalUpdateSerializer, GroupsStatsResponseSerializer,
+    JoinRequestsStatsSerializer, GroupJoinRequestCreateSerializer
 )
 
 import cloudinary.uploader
@@ -316,20 +319,28 @@ class CreateSavingsGroupView(APIView):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @extend_schema(
-    description="Lists all savings groups created (and thus administered) by the authenticated user.",
+    description="Lists all savings groups the authenticated user is a member of (including groups they created/admin). "
+                "Includes personal total_savings and next_due date.",
     tags=['Savings Groups'],
     responses={
         200: SavingsGroupSerializer(many=True),
         401: {'description': 'Authentication credentials were not provided.'}
     }
 )
-class MyGroupsListView(generics.ListAPIView):
-    """Groups where user is the admin"""
+class MyJoinedGroupsListView(generics.ListAPIView):
+    """
+    Replaces MyGroupsListView.
+    Shows groups the user has joined (as member or admin).
+    """
     serializer_class = SavingsGroupSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return SavingsGroup.objects.filter(admin=self.request.user).select_related('admin__profile')
+        user = self.request.user
+
+        return SavingsGroup.objects.filter(
+            members__user=user
+        ).select_related('admin__profile').distinct()
 
 @extend_schema(
     parameters=[
@@ -341,23 +352,29 @@ class MyGroupsListView(generics.ListAPIView):
             required=True
         ),
     ],
-    description="Retrieves the details of a single savings group. Access is restricted to the admin/creator.",
+    description="Retrieves the details of a single savings group. "
+                "Accessible to any member of the group (not just the admin). "
+                "Includes member's personal total_savings and next_due date.",
     tags=['Savings Groups'],
     responses={
         200: SavingsGroupSerializer,
         401: {'description': 'Authentication required.'},
-        404: {'description': 'Group not found or unauthorized access.'}
+        403: {'description': 'You are not a member of this group.'},
+        404: {'description': 'Group not found.'}
     }
 )
 class GroupDetailView(generics.RetrieveAPIView):
-    """Single group detail"""
+    """
+    Updated: Now allows any group member to view details.
+    """
     serializer_class = SavingsGroupSerializer
     permission_classes = [IsAuthenticated]
     lookup_field = 'id'
 
     def get_queryset(self):
         user = self.request.user
-        return SavingsGroup.objects.filter(admin=user)
+        # Only return the group if the user is a member
+        return SavingsGroup.objects.filter(members__user=user).select_related('admin__profile')
 
 @extend_schema(
     description="Lists all Active savings groups across the platform, allowing filtering and searching.",
@@ -430,8 +447,35 @@ class GroupJoinRequestView(APIView):
     """Endpoint for users to request to join a group."""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        request=GroupJoinRequestCreateSerializer,
+        responses={
+            201: inline_serializer(
+                name='JoinRequestSuccess',
+                fields={
+                    'message': serializers.CharField(),
+                }
+            ),
+            200: inline_serializer(
+                name='JoinRequestResubmitSuccess',
+                fields={
+                    'message': serializers.CharField(),
+                }
+            ),
+            400: {'description': 'Bad request (already member, pending, etc.)'},
+            404: {'description': 'Group not found or not active.'}
+        },
+        description="Submit a request to join an active savings group. "
+                    "Optionally include a 'reason' to help the admin decide.",
+        tags=['Savings Groups']
+    )
+
     @transaction.atomic
     def post(self, request, group_id):
+        serializer = GroupJoinRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reason = serializer.validated_data.get('reason', '')
+
         try:
             group = SavingsGroup.objects.get(id=group_id, status='active')
         except SavingsGroup.DoesNotExist:
@@ -441,41 +485,47 @@ class GroupJoinRequestView(APIView):
         user = request.user
 
         # Check if already an approved member
-        if GroupMembership.objects.filter(user=user, group_id=group_id).exists():
-            return Response({"error": "You are already a member of this group."},
-                            status=status.HTTP_400_BAD_REQUEST)
+        if GroupMembership.objects.filter(user=user, group=group).exists():
+            return Response(
+                {"error": "You are already a member of this group."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
-            existing_request = GroupJoinRequest.objects.get(user=user, group_id=group_id)
-
+            existing_request = GroupJoinRequest.objects.get(user=user, group=group)
             if existing_request.status == 'approved':
-                return Response({"error": "Your request was already approved."},
-                                status=status.HTTP_400_BAD_REQUEST)
-
+                return Response(
+                    {"error": "Your request was already approved."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             elif existing_request.status == 'pending':
-                return Response({"error": "You already have a pending request for this group."},
-                                status=status.HTTP_400_BAD_REQUEST)
-
+                return Response(
+                    {"error": "You already have a pending request for this group."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             elif existing_request.status == 'rejected':
+                # Allow re-submit with updated reason
                 existing_request.status = 'pending'
+                existing_request.reason = reason
                 existing_request.requested_at = timezone.now()
                 existing_request.handled_at = None
                 existing_request.handled_by = None
-                existing_request.save(update_fields=['status', 'requested_at', 'handled_at', 'handled_by'])
-
+                existing_request.save()
                 send_group_join_request_email_async.delay(existing_request.id)
-
-                return Response({"message": f"Previous request re-submitted to admin of {group.group_name}."},
-                                status=status.HTTP_200_OK)
-
+                return Response({
+                    "message": f"Previous request re-submitted to admin of {group.group_name}."
+                }, status=status.HTTP_200_OK)
         except GroupJoinRequest.DoesNotExist:
-            # 4. No request exists yet, so create a new one
-            new_request = GroupJoinRequest.objects.create(user=user, group=group, status='pending')
-
+            new_request = GroupJoinRequest.objects.create(
+                user=user,
+                group=group,
+                status='pending',
+                reason=reason
+            )
             send_group_join_request_email_async.delay(new_request.id)
-
-            return Response({"message": f"Join request sent to admin of {group.group_name}. The admin has been notified via email."},
-                            status=status.HTTP_201_CREATED)
+            return Response({
+                "message": f"Join request sent to admin of {group.group_name}. The admin has been notified via email."
+            }, status=status.HTTP_201_CREATED)
 
 @extend_schema(
     responses={
@@ -896,3 +946,101 @@ class GoalDetailView(RetrieveUpdateDestroyAPIView):
 
     def perform_destroy(self, instance):
         instance.delete()
+
+
+@extend_schema(
+    description=(
+        "Provides aggregated statistics for the 'Groups' page cards: "
+        "- Total Groups: Count of active groups the authenticated user is a member of. "
+        "- Total Members: Sum of members across those active groups. "
+        "- Group Savings: Sum of verified contributions in the current cycle (current 'pot') across those groups."
+    ),
+    tags=['Savings Groups'],
+    responses={
+        200: GroupsStatsResponseSerializer,
+        401: {'description': 'Authentication required.'}
+    }
+)
+class GroupsStatsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        active_groups = SavingsGroup.objects.filter(
+            members__user=user,
+            status='active'
+        ).distinct()
+
+        total_groups = active_groups.count()
+
+        total_members = active_groups.aggregate(
+            total_members=Sum('current_members')
+        )['total_members'] or 0
+
+        # Compute combined current savings (sum of current cycle verified contributions per group)
+        # Loop is acceptable as users typically join few groups (<10); optimizes for readability.
+        group_savings = Decimal('0.00')
+        for group in active_groups:
+            current_cycle = group.current_cycle_number
+            cycle_total = Contribution.objects.filter(
+                membership__group=group,
+                cycle_number=current_cycle,
+                is_verified=True
+            ).aggregate(
+                total=Sum('amount')
+            )['total'] or Decimal('0.00')
+            group_savings += cycle_total
+
+        return Response({
+            'total_groups': total_groups,
+            'total_members': total_members,
+            'group_savings': float(group_savings)
+        })
+
+@extend_schema(
+    description=(
+        "Provides aggregated statistics for the 'Join Requests' admin dashboard cards: "
+        "- Pending: Count of pending join requests across all groups the authenticated user administers. "
+        "- Accepted: Count of approved requests. "
+        "- Declined: Count of rejected requests."
+    ),
+    tags=['Savings Groups', 'Admin'],
+    responses={200: JoinRequestsStatsSerializer},
+    auth=['Bearer'],
+)
+class JoinRequestsStatsView(APIView):
+    """
+    Dedicated endpoint for group admins to get quick stats for the Join Requests page.
+    Only accessible to users who are admins of at least one group.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        # Get all groups this user administers
+        admin_groups = SavingsGroup.objects.filter(admin=user).values_list('id', flat=True)
+
+        if not admin_groups:
+            return Response({
+                'pending': 0,
+                'accepted': 0,
+                'declined': 0
+            })
+
+        from django.db.models import Count, Q
+
+        stats = GroupJoinRequest.objects.filter(
+            group_id__in=admin_groups
+        ).aggregate(
+            pending=Count('id', filter=Q(status='pending')),
+            accepted=Count('id', filter=Q(status='approved')),
+            declined=Count('id', filter=Q(status='rejected')),
+        )
+
+        # Ensure all keys exist even if zero
+        return Response({
+            'pending': stats['pending'] or 0,
+            'accepted': stats['accepted'] or 0,
+            'declined': stats['declined'] or 0,
+        })
