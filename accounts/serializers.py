@@ -234,15 +234,45 @@ class SavingsGroupSerializer(serializers.ModelSerializer):
     admin_photo = serializers.URLField(source='admin.profile.profile_picture', read_only=True, allow_null=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
 
+    total_savings = serializers.SerializerMethodField(
+        help_text="Total amount the admin (you) has personally contributed to this group across ALL cycles (historical + current)."
+    )
+    next_due = serializers.SerializerMethodField(
+        help_text="Next payout date (end of current contribution cycle)."
+    )
+
     class Meta:
         model = SavingsGroup
         fields = [
             'id', 'group_name', 'contribution_amount', 'frequency',
             'payout_timeline_days', 'expected_members', 'current_members',
             'description', 'status', 'status_display', 'created_at',
-            'admin_name', 'admin_phone', 'admin_photo'
+            'admin_name', 'admin_phone', 'admin_photo',
+            'total_savings', 'next_due'
         ]
         read_only_fields = ['status', 'current_members', 'created_at']
+
+    @extend_schema_field(OpenApiTypes.FLOAT)
+    def get_total_savings(self, obj):
+        """
+        Returns the users total personal contributions across ALL cycles in this group.
+        """
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return 0.0
+
+        try:
+            membership = obj.members.get(user=request.user)
+            total = membership.contributions.aggregate(total=Sum('amount'))['total']
+            return float(total or 0.0)
+        except GroupMembership.DoesNotExist:
+            return 0.0
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_next_due(self, obj):
+        if obj.next_payout_date:
+            return obj.next_payout_date.strftime('%m/%d/%Y')
+        return None
 
 class RequestingUserSerializer(serializers.ModelSerializer):
     """Minimal serializer to show details of the user who submitted the request."""
@@ -258,6 +288,14 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
     user_details = RequestingUserSerializer(source='user', read_only=True)
     group_name = serializers.CharField(source='group.group_name', read_only=True)
 
+    reason = serializers.CharField(
+        allow_blank=True,
+        allow_null=True,
+        required=False,
+        default='',
+        help_text="Reason provided by the user when requesting to join."
+    )
+
     class Meta:
         model = GroupJoinRequest
         fields = [
@@ -267,7 +305,8 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
             'user',
             'user_details',
             'status',
-            'requested_at'
+            'requested_at',
+            'reason'
         ]
         read_only_fields = ['group', 'user', 'status', 'requested_at', 'handled_by', 'handled_at']
 
@@ -277,6 +316,24 @@ class GroupJoinActionSerializer(serializers.Serializer):
         choices=['approve', 'reject'],
         help_text="Action to take on the request: 'approve' or 'reject'."
     )
+
+class GroupJoinRequestCreateSerializer(serializers.Serializer):
+    """
+    Serializer for submitting a join request to a savings group.
+    Only 'reason' is accepted from the user input.
+    """
+    reason = serializers.CharField(
+        max_length=1000,
+        allow_blank=True,
+        required=False,
+        trim_whitespace=True,
+        help_text="Optional explanation of why you want to join this group. This will be visible to the group admin."
+    )
+
+    def validate_reason(self, value):
+        if value and len(value.strip()) < 10:
+            raise serializers.ValidationError("Reason should be at least 10 characters if provided.")
+        return value.strip()
 
 class GroupDashboardCardSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(read_only=True)
@@ -468,3 +525,21 @@ class SavingsGoalUpdateSerializer(serializers.ModelSerializer):
         if 'target_amount' in data and instance and data['target_amount'] < instance.current_saved:
             raise serializers.ValidationError("Cannot set target below current saved amount.")
         return data
+
+
+class GroupsStatsResponseSerializer(serializers.Serializer):
+    total_groups = serializers.IntegerField(help_text="Number of active groups the user is currently a member of.")
+    total_members = serializers.IntegerField(help_text="Total number of members across all the user's active groups.")
+    group_savings = serializers.FloatField(help_text="Combined total of current savings (sum of verified contributions in the current cycle) across all the user's active groups.")
+
+
+class JoinRequestsStatsSerializer(serializers.Serializer):
+    pending = serializers.IntegerField(
+        help_text="Number of pending join requests across all groups administered by the user."
+    )
+    accepted = serializers.IntegerField(
+        help_text="Number of accepted join requests across all groups administered by the user."
+    )
+    declined = serializers.IntegerField(
+        help_text="Number of declined (rejected) join requests across all groups administered by the user."
+    )
