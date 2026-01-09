@@ -1,5 +1,3 @@
-# accounts/tests/test_auth_security.py
-
 import pytest
 from django.urls import reverse
 from unittest.mock import patch
