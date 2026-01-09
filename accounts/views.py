@@ -1,6 +1,11 @@
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, inline_serializer, OpenApiTypes
-from .models import SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder,  SavingsGoal, GoalContribution
-from .tasks import send_dawurobo_otp_sync, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
+import uuid
+import hashlib
+import logging
+import cloudinary.uploader
+from django.conf import settings
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, inline_serializer
+from .models import LedgerEntry, Wallet, SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder,  SavingsGoal, GoalContribution
+from .tasks import send_dawurobo_otp_async, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django_filters.rest_framework import DjangoFilterBackend
@@ -14,15 +19,17 @@ from rest_framework.filters import SearchFilter
 from django.contrib.auth import get_user_model
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework import generics, status
+from rest_framework import generics, status, permissions
 from .permissions import IsGroupAdmin
 from django.utils import timezone
-from django.db.models import Sum
+from django.db.models import Sum, F
 from dateutil.relativedelta import relativedelta
+import phonenumbers
 from decimal import Decimal
 from rest_framework.generics import RetrieveUpdateDestroyAPIView
 from rest_framework import serializers
-
+from .utils import idempotent_request
+from .services import LedgerService
 from .serializers import (
     GoalDashboardCardSerializer, SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
     CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
@@ -32,12 +39,8 @@ from .serializers import (
     JoinRequestsStatsSerializer, GroupJoinRequestCreateSerializer
 )
 
-import cloudinary.uploader
-import logging
-
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('accounts.finance')
 User = get_user_model()
-
 
 class CustomLoginView(TokenObtainPairView):
     permission_classes = [AllowAny]
@@ -51,6 +54,7 @@ class ForgotPasswordView(APIView):
     @method_decorator(ratelimit(key='ip', rate='10/m', method='POST', block=True))
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
+        User = get_user_model()
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -66,7 +70,7 @@ class ForgotPasswordView(APIView):
                             status=status.HTTP_404_NOT_FOUND)
 
         momo_number = str(user.profile.momo_number)
-        result = send_dawurobo_otp_sync(momo_number)
+        result = send_dawurobo_otp_async(momo_number)
 
         if result.get("success"):
             return Response({
@@ -78,7 +82,10 @@ class ForgotPasswordView(APIView):
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-@method_decorator(never_cache, name='dispatch')
+@method_decorator([
+    never_cache,
+    ratelimit(key='ip', rate='5/h', method='POST', block=True)
+], name='dispatch')
 @extend_schema(
     request=FullSignupSerializer,
     responses={
@@ -97,18 +104,19 @@ class ForgotPasswordView(APIView):
     tags=['Authentication & Registration']
 )
 class FullSignupView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [permissions.AllowAny]
     parser_classes = [MultiPartParser]
 
+    @extend_schema(description="Register user and profile. Triggers OTP.")
     @transaction.atomic
+    @idempotent_request
     def post(self, request):
         data = request.data
+
         required_fields = [
             'email', 'password', 'password2', 'full_name', 'date_of_birth',
             'user_type', 'ghana_post_address', 'momo_provider', 'momo_number', 'momo_name'
         ]
-
-        # Check required fields
         for field in required_fields:
             if not data.get(field):
                 return Response(
@@ -116,20 +124,18 @@ class FullSignupView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Password match
         if data['password'] != data['password2']:
-            return Response({"error": "Passwords do not match"}, status=400)
+            return Response({"error": "Passwords do not match"}, status=status.HTTP_400_BAD_REQUEST)
 
-        email = data['email'].lower().lower().strip()
+        email = data['email'].lower().strip()
         momo_number = str(data['momo_number']).strip()
 
-        # Uniqueness checks
         if User.objects.filter(email=email).exists():
-            return Response({"error": "This email is already registered"}, status=400)
+            return Response({"error": "This email is already registered"}, status=status.HTTP_400_BAD_REQUEST)
         if Profile.objects.filter(momo_number=momo_number).exists():
-            return Response({"error": "This MoMo number is already registered"}, status=400)
+            return Response({"error": "This MoMo number is already registered"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Handle profile picture
+        # Handle File Upload
         profile_picture_url = None
         if 'profile_picture' in request.FILES:
             try:
@@ -142,12 +148,11 @@ class FullSignupView(APIView):
                     ]
                 )
                 profile_picture_url = upload_result.get('secure_url')
-                logger.info(f"Profile picture uploaded: {profile_picture_url}")
             except Exception as e:
-                logger.warning(f"Cloudinary upload failed (continuing without photo): {e}")
+                logger.warning(f"Cloudinary upload failed: {e}")
+
         try:
             with transaction.atomic():
-                # Create user
                 user = User.objects.create_user(
                     email=email,
                     username=email.split('@')[0],
@@ -155,7 +160,7 @@ class FullSignupView(APIView):
                     is_verified=False
                 )
 
-                # Create profile
+                # Create Profile
                 Profile.objects.create(
                     user=user,
                     full_name=data['full_name'],
@@ -168,23 +173,27 @@ class FullSignupView(APIView):
                     momo_name=data['momo_name']
                 )
 
-                # Send OTP via Dawurobo
-                result = send_dawurobo_otp_sync(momo_number)
+                otp_result = send_dawurobo_otp_async(momo_number)
+                if not otp_result.get("success"):
+                    raise Exception("SMS provider error")
 
-                if not result.get("success"):
-                    raise Exception("OTP sending failed")
-
-        except IntegrityError:
-            return Response({"error": "Email or phone already in use"}, status=400)
         except Exception as e:
-            logger.error(f"Signup failed: {e}")
-            return Response({"error": "Account creation failed. Please try again."}, status=500)
+            logger.error(f"Signup Transaction Failed: {str(e)}")
+            return Response({"error": "Registration failed. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        logger.info({
+            "event": "user_registered",
+            "user_id": user.id,
+            "momo_mask": f"***-{momo_number[-4:]}",
+            "wallet_initialized": True
+        })
 
         return Response({
-            "message": "Account created successfully! OTP sent to your phone.",
+            "message": "Account created successfully! OTP sent.",
             "phone": momo_number,
             "next_step": "verify_otp"
-        }, status=201)
+        }, status=status.HTTP_201_CREATED)
+
 
 @method_decorator([never_cache, ratelimit(key='ip', rate='5/m', method='POST', block=True)], name='dispatch')
 class ResetPasswordView(APIView):
@@ -204,15 +213,33 @@ class ResetPasswordView(APIView):
             return Response({"error": "Invalid or expired OTP"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            profile = Profile.objects.select_related('user').get(momo_number=phone)
+            # Normalize the phone number
+            try:
+                parsed_num = phonenumbers.parse(phone, "GH")
+                if phonenumbers.is_valid_number(parsed_num):
+                    normalized_phone = phonenumbers.format_number(parsed_num, phonenumbers.PhoneNumberFormat.E164)
+                else:
+                    normalized_phone = phone.strip()
+            except Exception:
+                normalized_phone = phone.strip()
+
+            # Generate the Hash
+            salt = getattr(settings, "HASH_SALT", settings.SECRET_KEY)
+            hash_input = f"{normalized_phone}{salt}".encode('utf-8')
+            phone_hash = hashlib.sha256(hash_input).hexdigest()
+
+            # Lookup using the HASH field, NOT the encrypted field
+            profile = Profile.objects.select_related('user').get(momo_number_hash=phone_hash)
+
             user = profile.user
             user.set_password(new_password)
             user.save(update_fields=['password'])
-            logger.info(f"Password reset successful for {user.email} ({phone})")
+
+            logger.info(f"Password reset successful for {user.email}")
             return Response({"message": "Password reset successful. You can now log in."})
+
         except Profile.DoesNotExist:
             return Response({"error": "Invalid request"}, status=status.HTTP_400_BAD_REQUEST)
-
 
 class SendOTPView(APIView):
     permission_classes = [AllowAny]
@@ -225,14 +252,18 @@ class SendOTPView(APIView):
             return Response(serializer.errors, status=400)
 
         phone = serializer.validated_data['phone_number']
-        result = send_dawurobo_otp_sync(phone)
+        result = send_dawurobo_otp_async(phone)
 
         if result.get("success"):
             return Response({"message": "OTP sent again!"}, status=200)
         else:
             return Response({"error": "Failed to send OTP"}, status=500)
 
-
+@method_decorator([
+    never_cache,
+    ratelimit(key='ip', rate='5/m', method='POST', block=True),
+    ratelimit(key='post:phone_number', rate='3/m', method='POST', block=True)
+], name='dispatch')
 class VerifyOTPView(APIView):
     permission_classes = [AllowAny]
     serializer_class = VerifyOTPSerializer
@@ -275,8 +306,8 @@ class MeView(APIView):
         description="Retrieves the current authenticated user's details and profile data.",
         tags=['User Management']
     )
-
     def get(self, request):
+        User = get_user_model()
         user = User.objects.select_related('profile').get(pk=request.user.pk)
         profile = user.profile
         return Response({
@@ -293,30 +324,43 @@ class MeView(APIView):
 class CreateSavingsGroupView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
-    serializer_class = SavingsGroupCreateSerializer
 
+    @transaction.atomic
     def post(self, request):
         serializer = SavingsGroupCreateSerializer(data=request.data, context={'request': request})
+
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            group = serializer.save()
+            # Create the Group
+            group = serializer.save(admin=request.user)
+
+            # Add Admin as the first member
+            from .models import GroupMembership, PayoutOrder
+            membership = GroupMembership.objects.create(
+                user=request.user,
+                group=group
+            )
+
+            # Initialize Payout Order for the Admin (as first member)
+            PayoutOrder.objects.create(
+                group=group,
+                membership=membership,
+                position=1
+            )
+
+            logger.info(f"Group {group.group_name} created by {request.user.email}. Wallet initialized via signal.")
+
             return Response({
                 "success": True,
-                "message": "Savings group created successfully! Awaiting admin approval.",
-                "group": {
-                    "id": group.id,
-                    "name": group.group_name,
-                    "status": group.status,
-                    "created_at": group.created_at
-                }
+                "message": "Savings group created! You have been added as the first member.",
+                "group_id": group.id
             }, status=status.HTTP_201_CREATED)
+
         except Exception as e:
             logger.error(f"Group creation failed: {e}")
-            return Response({
-                "error": "Failed to create group. Please try again."
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": "Failed to create group."}, status=500)
 
 @extend_schema(
     description="Lists all savings groups the authenticated user is a member of (including groups they created/admin). "
@@ -339,7 +383,7 @@ class MyJoinedGroupsListView(generics.ListAPIView):
         user = self.request.user
 
         return SavingsGroup.objects.filter(
-            members__user=user
+            memberships__user=user
         ).select_related('admin__profile').distinct()
 
 @extend_schema(
@@ -374,7 +418,7 @@ class GroupDetailView(generics.RetrieveAPIView):
     def get_queryset(self):
         user = self.request.user
         # Only return the group if the user is a member
-        return SavingsGroup.objects.filter(members__user=user).select_related('admin__profile')
+        return SavingsGroup.objects.filter(memberships__user=user).select_related('admin__profile')
 
 @extend_schema(
     description="Lists all Active savings groups across the platform, allowing filtering and searching.",
@@ -433,43 +477,30 @@ class AllGroupsListView(generics.ListAPIView):
             .select_related('admin__profile')
         )
 
-@extend_schema(
-    request=None,
-    responses={
-        201: {'description': 'Request submitted successfully.'},
-        400: {'description': 'Already a member or request pending.'},
-        404: {'description': 'Group not found or not active.'}
-    },
-    description="Allows an authenticated user to submit a join request to an active group.",
-    tags=['Savings Groups']
-)
+
 class GroupJoinRequestView(APIView):
     """Endpoint for users to request to join a group."""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
-        request=GroupJoinRequestCreateSerializer,
-        responses={
-            201: inline_serializer(
-                name='JoinRequestSuccess',
-                fields={
-                    'message': serializers.CharField(),
-                }
-            ),
-            200: inline_serializer(
-                name='JoinRequestResubmitSuccess',
-                fields={
-                    'message': serializers.CharField(),
-                }
-            ),
-            400: {'description': 'Bad request (already member, pending, etc.)'},
-            404: {'description': 'Group not found or not active.'}
-        },
-        description="Submit a request to join an active savings group. "
-                    "Optionally include a 'reason' to help the admin decide.",
-        tags=['Savings Groups']
-    )
-
+            request=GroupJoinRequestCreateSerializer,
+            responses={
+                201: inline_serializer(
+                    name='JoinRequestSuccess',
+                    fields={'message': serializers.CharField()}
+                ),
+                200: inline_serializer(
+                    name='JoinRequestResubmitSuccess',
+                    fields={'message': serializers.CharField()}
+                ),
+                400: {'description': 'Bad request (already member, pending, etc.)'},
+                404: {'description': 'Group not found or not active.'}
+            },
+            description="Submit a request to join an active savings group. "
+                        "Optionally include a 'reason' to help the admin decide.",
+            tags=['Savings Groups']
+        )
+    @idempotent_request
     @transaction.atomic
     def post(self, request, group_id):
         serializer = GroupJoinRequestCreateSerializer(data=request.data)
@@ -511,22 +542,28 @@ class GroupJoinRequestView(APIView):
                 existing_request.handled_at = None
                 existing_request.handled_by = None
                 existing_request.save()
+
+                # Side effect: Trigger email
                 send_group_join_request_email_async.delay(existing_request.id)
+
                 return Response({
                     "message": f"Previous request re-submitted to admin of {group.group_name}."
                 }, status=status.HTTP_200_OK)
+
         except GroupJoinRequest.DoesNotExist:
+            # Create brand new request
             new_request = GroupJoinRequest.objects.create(
                 user=user,
                 group=group,
                 status='pending',
                 reason=reason
             )
+
             send_group_join_request_email_async.delay(new_request.id)
+
             return Response({
                 "message": f"Join request sent to admin of {group.group_name}. The admin has been notified via email."
             }, status=status.HTTP_201_CREATED)
-
 @extend_schema(
     responses={
         200: GroupJoinRequestSerializer(many=True),
@@ -567,221 +604,311 @@ class GroupRequestsListView(generics.ListAPIView):
     tags=['Savings Groups']
 )
 class GroupRequestActionView(APIView):
-    """Endpoint for Group Admin to approve or reject a specific join request."""
+    """
+    Handles approval/rejection of group join requests.
+    Employs pessimistic locking to prevent race conditions during group filling.
+    """
     permission_classes = [IsAuthenticated, IsGroupAdmin]
-    def get_object(self, pk):
-        try:
-            request_obj = GroupJoinRequest.objects.get(pk=pk)
-            self.check_object_permissions(self.request, request_obj)
-            return request_obj
-        except GroupJoinRequest.DoesNotExist:
-            raise status.HTTP_404_NOT_FOUND
+
     @transaction.atomic
     def post(self, request, pk):
+        # Pessimistic Lock on the Request Row (prevents two threads from processing the SAME request simultaneously.)
         try:
-            request_obj = GroupJoinRequest.objects.select_related('group__admin').get(pk=pk)
+            request_obj = GroupJoinRequest.objects.select_for_update(of=('self',)).select_related(
+                'group__admin',
+                'user__profile'
+            ).get(pk=pk)
         except GroupJoinRequest.DoesNotExist:
             return Response({"error": "Join request not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Authorization Check
         if request_obj.group.admin != request.user:
             return Response({'detail': 'You are not authorized to handle this request.'},
                             status=status.HTTP_403_FORBIDDEN)
-        # Validation of input action
-        serializer = GroupJoinActionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        action = serializer.validated_data['action']
-        # Status Check
+
+        # Status Validation
         if request_obj.status != 'pending':
             return Response({"error": f"Request is already {request_obj.status}."},
                             status=status.HTTP_400_BAD_REQUEST)
+
+        # Input Validation
+        serializer = GroupJoinActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        action = serializer.validated_data['action']
+
+        # Lock the Group Row (prevents race condition where two different users fill the last spot.)
+        group = SavingsGroup.objects.select_for_update().get(id=request_obj.group.id)
+
         if action == 'approve':
-            group = request_obj.group
-            # Check if group is full
+            # Capacity check inside the lock
             if group.current_members >= group.expected_members:
                 return Response({'error': 'Cannot approve. Group is already full.'},
                                 status=status.HTTP_400_BAD_REQUEST)
+
             try:
+                # Create membership
                 GroupMembership.objects.create(user=request_obj.user, group=group)
-                # Increment group member count
+
+                # Increment member count
                 group.current_members += 1
                 group.save(update_fields=['current_members'])
+
+                # Update Request Status
                 request_obj.status = 'approved'
                 request_obj.handled_by = request.user
                 request_obj.handled_at = timezone.now()
                 request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
-                send_group_join_response_email_async.delay(pk, 'approved')
-                message = "User approved and added to the group successfully."
 
-                # Auto-start logic: If group is now full and active, set start_date and generate payout order
-                if group.status == 'active' and group.current_members >= group.expected_members and not group.start_date:
+                # Log Admin Action
+                logger.info({
+                    "event": "group_join_approved",
+                    "admin_id": request.user.id,
+                    "target_user_id": request_obj.user.id,
+                    "group_id": group.id,
+                    "request_id": getattr(request, 'request_id', None)
+                })
+
+                message = "User approved and added to the group."
+
+                # Automatic Group Activation & Payout Order
+                if group.current_members >= group.expected_members and not group.start_date:
                     group.start_date = timezone.now().date()
                     group.save(update_fields=['start_date'])
 
-                    # Generate payout order based on join order (earliest first)
+                    # Generate Rotation: Earliest joined members get paid first
                     memberships = GroupMembership.objects.filter(group=group).order_by('joined_at')
-                    for pos, membership in enumerate(memberships, start=1):
-                        PayoutOrder.objects.get_or_create(
-                            group=group,
-                            membership=membership,
-                            defaults={'position': pos}
-                        )
-                    message += " Group is now full and has been automatically started."
+                    payout_objs = [
+                        PayoutOrder(group=group, membership=m, position=idx)
+                        for idx, m in enumerate(memberships, start=1)
+                    ]
+                    PayoutOrder.objects.bulk_create(payout_objs)
+
+                    message += " Group is now full and payout cycles have been initialized."
+
+                    logger.info({
+                        "event": "group_activated",
+                        "group_id": group.id,
+                        "start_date": str(group.start_date),
+                        "request_id": getattr(request, 'request_id', None)
+                    })
+
+                send_group_join_response_email_async.delay(pk, 'approved')
 
             except IntegrityError:
-                return Response({"error": "User is already a confirmed member of this group."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "User is already a member."}, status=400)
+
         elif action == 'reject':
             request_obj.status = 'rejected'
             request_obj.handled_by = request.user
             request_obj.handled_at = timezone.now()
             request_obj.save(update_fields=['status', 'handled_by', 'handled_at'])
+
+            logger.info({
+                "event": "group_join_rejected",
+                "admin_id": request.user.id,
+                "target_user_id": request_obj.user.id,
+                "group_id": group.id,
+                "request_id": getattr(request, 'request_id', None)
+            })
+
             send_group_join_response_email_async.delay(pk, 'rejected')
             message = "User request has been rejected."
-        else:
-            message = "Invalid action."
-            return Response({"error": message}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response({"message": message}, status=status.HTTP_200_OK)
 
-@extend_schema(
-    description="Retrieves the authenticated user's personalized dashboard: "
-                "total savings from all contributions across groups, "
-                "growth percentage compared to last month, "
-                "and detailed cards for each active savings group the user has joined.",
-    tags=['User Dashboard'],
-    responses={
-        200: DashboardResponseSerializer,
-        401: {'description': 'Authentication credentials were not provided.'}
-    }
-)
+
 class DashboardView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        description="Retrieves the authenticated user's personalized dashboard.",
+        tags=['User Dashboard'],
+        responses={
+            200: DashboardResponseSerializer,
+            401: {'description': 'Authentication credentials were not provided.'}
+        }
+    )
     def get(self, request):
         user = request.user
-        memberships = GroupMembership.objects.filter(user=user).select_related('group')
 
-        # Total savings: all user's contributions across all groups
-        total_savings = user.memberships.annotate(
-            contrib_sum=Sum('contributions__amount')
-        ).aggregate(grand_total=Sum('contrib_sum'))['grand_total'] or 0
+        total_savings = LedgerEntry.objects.filter(
+        wallet__user=user,
+        transaction_type__in=['contribution', 'goal_contribution'],
+        direction='credit'
+    ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        # Growth % compared to last period
+        # Previous Period Savings
         one_month_ago = timezone.now() - relativedelta(months=1)
         previous_period_savings = Contribution.objects.filter(
             membership__user=user,
+            is_verified=True,
             paid_at__lt=one_month_ago
-        ).aggregate(total=Sum('amount'))['total'] or 0
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
+        # Growth Percentage Calculation
         if previous_period_savings > 0:
             growth_percentage = ((total_savings - previous_period_savings) / previous_period_savings) * 100
         else:
-            growth_percentage = 100 if total_savings > 0 else 0
+            growth_percentage = 100.0 if total_savings > 0 else 0.0
 
-        # Groups cards
-        groups = [m.group for m in memberships if m.group.status == 'active']
-        groups_serializer = GroupDashboardCardSerializer(
-            groups, many=True, context={'request': request}
+
+        active_memberships = GroupMembership.objects.filter(
+            user=user,
+            group__status='active'
+        ).select_related('group').prefetch_related(
+            'group__memberships__contributions'
         )
 
+        groups = [m.group for m in active_memberships]
+
+        groups_serializer = GroupDashboardCardSerializer(
+             groups, many=True, context={'request': request}
+        )
+
+        growth_val = round(float(growth_percentage), 1)
         return Response({
-            "total_savings": float(total_savings),
-            "growth_percentage": round(growth_percentage, 1),
-            "growth_text": f"{ '+' if growth_percentage >= 0 else '' }{round(growth_percentage, 1)}% from last month",
+            "total_savings": total_savings,
+            "growth_percentage": growth_val,
+            "growth_text": f"{ '+' if growth_val >= 0 else '' }{growth_val}% from last month",
             "joined_groups": groups_serializer.data
         })
 
-@extend_schema(
-    description="Manually record a contribution for the current cycle in an active savings group. "
-                "The user must be a member. Only one contribution per cycle is allowed. "
-                "(Future: This will be secured and verified via Paystack/Hubtel webhook after payment initialization.)",
-    tags=['Savings Groups'],
-    request=None,
-    responses={
-        201: {
-            'type': 'object',
-            'properties': {
-                'message': {'type': 'string', 'example': 'Contribution recorded successfully'},
-                'contribution_id': {'type': 'integer', 'example': 42},
-                'amount': {'type': 'number', 'format': 'float', 'example': 200.00},
-                'cycle': {'type': 'integer', 'example': 1}
-            }
-        },
-        400: {'description': 'Already contributed in this cycle or invalid data.'},
-        404: {'description': 'Group not found, not active, or user not a member.'},
-        401: {'description': 'Authentication required.'}
-    }
-)
 class ContributeView(APIView):
+    """
+    Handles contributions to a specific savings group.
+    Employs pessimistic locking to prevent race conditions in financial balances.
+    Rate limited by user to prevent transaction flooding.
+    """
     permission_classes = [IsAuthenticated]
-
+    @extend_schema(
+        description="Manually record a contribution for the current cycle in an active savings group. "
+                    "The user must be a member. Only one contribution per cycle is allowed.",
+        tags=['Savings Groups'],
+        request=None,
+        responses={
+            201: {'description': 'Contribution recorded successfully'},
+            400: {'description': 'Insufficient funds or already contributed in this cycle.'},
+            404: {'description': 'Group not found, not active, or user not a member.'},
+        }
+    )
+    @idempotent_request
+    @method_decorator(ratelimit(key='user', rate='5/m', method='POST', block=True))
+    @transaction.atomic
     def post(self, request, group_id):
-        try:
-            group = SavingsGroup.objects.get(
-                id=group_id,
-                status='active'
+
+        # Ensure only verified users can move money
+        if not request.user.is_verified:
+            return Response(
+                {"error": "You must complete KYC/Verification to contribute."},
+                status=status.HTTP_403_FORBIDDEN
             )
-            membership = GroupMembership.objects.get(
+
+        try:
+            # Lock the group. Ensure cycle and status don't change.
+            group = SavingsGroup.objects.select_for_update().get(id=group_id, status='active')
+
+            # Lock the membership. Prevent concurrent hits for same group/user.
+            membership = GroupMembership.objects.select_for_update().get(
                 user=request.user,
                 group=group
             )
-        except SavingsGroup.DoesNotExist:
-            return Response(
-                {"error": "Group not found or not active"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except GroupMembership.DoesNotExist:
-            return Response(
-                {"error": "You are not a member of this group"},
-                status=status.HTTP_404_NOT_FOUND
-            )
 
+            # Fetch and lock the user's wallet for balance update.
+            wallet = Wallet.objects.select_for_update().get(user=request.user)
+        except SavingsGroup.DoesNotExist:
+            return Response({"error": "Group not found or not active"}, status=status.HTTP_404_NOT_FOUND)
+        except GroupMembership.DoesNotExist:
+            return Response({"error": "You are not a member of this group"}, status=status.HTTP_404_NOT_FOUND)
+        except Wallet.DoesNotExist:
+            return Response({"error": "User wallet not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check if already contributed this cycle
         current_cycle = group.current_cycle_number
-        if Contribution.objects.filter(
-            membership=membership,
-            cycle_number=current_cycle
-        ).exists():
+        if Contribution.objects.filter(membership=membership, cycle_number=current_cycle).exists():
             return Response(
                 {"error": "You have already contributed for this cycle"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Record manual contribution (full amount) for now
+        # Check for sufficient funds
+        if wallet.current_balance < group.contribution_amount:
+            return Response(
+                {"error": "Insufficient wallet balance"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Record the Contribution record
         contribution = Contribution.objects.create(
             membership=membership,
             amount=group.contribution_amount,
             cycle_number=current_cycle,
-            is_verified=True  # Manual now; webhook later
+            is_verified=True
         )
+
+        # Record in Immutable Ledger
+        LedgerService.transfer(
+            amount=group.contribution_amount,
+            transaction_type='contribution',
+            description=f"Contribution to {group.group_name} (Cycle {current_cycle})",
+            reference=f"CONTRIB-{contribution.id}-{uuid.uuid4().hex[:8]}",
+            from_user=request.user,
+            to_group=group,
+            actor=request.user,
+            request_id=getattr(request, 'request_id', None),
+            related_group=group,
+        )
+
+        wallet.refresh_from_db()
+
+        # Structured Audit Logging
+        logger.info({
+            "event": "group_contribution_recorded",
+            "actor_id": request.user.id,
+            "group_id": group.id,
+            "amount": str(group.contribution_amount),
+            "cycle": current_cycle,
+            "new_balance": str(wallet.current_balance),
+            "request_id": getattr(request, 'request_id', None)
+        })
 
         return Response({
             "message": "Contribution recorded successfully",
             "contribution_id": contribution.id,
-            "amount": float(contribution.amount),
-            "cycle": current_cycle
+            "amount": contribution.amount,
+            "cycle": current_cycle,
+            "new_balance": wallet.current_balance
         }, status=status.HTTP_201_CREATED)
 
-@extend_schema(
-    request=SavingsGoalCreateSerializer,
-    responses={
-        201: inline_serializer(
-            name='CreateGoalResponse',
-            fields={
-                'success': rest_serializers.BooleanField(default=True),
-                'message': rest_serializers.CharField(),
-                'goal': SavingsGoalSerializer(),
-            }
-        )
-    },
-    description="Allows authenticated users to create a new personal savings goal.",
-    tags=['Savings Goals']
-)
+
 class CreateSavingsGoalView(APIView):
+    """
+    Allows authenticated users to create a new personal savings goal.
+    """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        request=SavingsGoalCreateSerializer,
+        responses={
+            201: inline_serializer(
+                name='CreateGoalResponse',
+                fields={
+                    'success': rest_serializers.BooleanField(default=True),
+                    'message': rest_serializers.CharField(),
+                    'goal': SavingsGoalSerializer(),
+                }
+            )
+        },
+        description="Allows authenticated users to create a new personal savings goal.",
+        tags=['Savings Goals']
+    )
+    @idempotent_request
     @transaction.atomic
     def post(self, request):
         serializer = SavingsGoalCreateSerializer(data=request.data, context={'request': request})
+
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             goal = serializer.save()
             return Response({
@@ -789,119 +916,151 @@ class CreateSavingsGoalView(APIView):
                 "message": "Savings goal created successfully!",
                 "goal": SavingsGoalSerializer(goal).data
             }, status=status.HTTP_201_CREATED)
+
         except Exception as e:
             logger.error(f"Goal creation failed: {e}")
             return Response({
                 "error": "Failed to create goal. Please try again."
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@extend_schema(
-    description="Retrieves the authenticated user's personalized goals dashboard: "
-                "overall totals, progress, active count, and detailed cards for each savings goal.",
-    tags=['Savings Goals'],
-    responses={
-        200: GoalsDashboardResponseSerializer,
-        401: {'description': 'Authentication required.'}
-    }
-)
+
 class GoalsDashboardView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        description="Retrieves the authenticated user's personalized goals dashboard.",
+        tags=['Savings Goals'],
+        responses={
+            200: GoalsDashboardResponseSerializer,
+            401: {'description': 'Authentication required.'}
+        }
+    )
     def get(self, request):
         user = request.user
-        goals = SavingsGoal.objects.filter(user=user)
+        today = timezone.now().date()
 
-        # Overview calculations
-        total_target = goals.aggregate(total=Sum('target_amount'))['total'] or Decimal('0.00')
-        total_saved = sum(goal.current_saved for goal in goals)
-        overall_progress = (float(total_saved) / float(total_target) * 100) if total_target > 0 else 0.0
-        active_goals_count = goals.filter(
-            id__in=[g.id for g in goals if g.is_active]
-        ).count()
+        # Fetch goals once
+        goals_queryset = SavingsGoal.objects.filter(user=user)
 
-        # Serialize goals
-        goals_serializer = GoalDashboardCardSerializer(goals, many=True)
+        total_target = goals_queryset.aggregate(total=Sum('target_amount'))['total'] or Decimal('0.00')
+
+        # Calculate total saved across ALL goals in ONE query
+        total_saved = GoalContribution.objects.filter(
+            goal__user=user,
+            is_verified=True
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        # Overall Progress
+        overall_progress = 0.0
+        if total_target > 0:
+            overall_progress = float((total_saved / total_target) * 100)
+
+        active_goals_count = 0
+        for goal in goals_queryset:
+            if goal.is_active:
+                active_goals_count += 1
+
+        goals_serializer = GoalDashboardCardSerializer(
+            goals_queryset,
+            many=True,
+            context={'request': request}
+        )
 
         return Response({
-            "total_target": float(total_target),
-            "total_saved": float(total_saved),
+            "total_target": total_target,
+            "total_saved": total_saved,
             "overall_progress": round(overall_progress, 1),
             "active_goals_count": active_goals_count,
             "goals": goals_serializer.data
         })
 
-@extend_schema(
-    description="Manually record a contribution to a savings goal. "
-                "The user must own the goal. Prevents contribution if target is already reached. "
-                "(Future: Secure with Paystack/Hubtel webhook.)",
-    tags=['Savings Goals'],
-    request=None,
-    responses={
-        201: {
-            'type': 'object',
-            'properties': {
-                'message': {'type': 'string', 'example': 'Contribution recorded successfully'},
-                'contribution_id': {'type': 'integer'},
-                'amount': {'type': 'number', 'format': 'float'},
-                'new_saved': {'type': 'number', 'format': 'float'}
-            }
-        },
-        400: {'description': 'Goal already completed or invalid state.'},
-        404: {'description': 'Goal not found or not owned by user.'},
-        401: {'description': 'Authentication required.'}
-    }
-)
 class ContributeToGoalView(APIView):
+    """Handles contributions to a specific personal savings goal."""
     permission_classes = [IsAuthenticated]
-
+    @extend_schema(
+        description="Record a contribution to a personal goal. Prevents over-contribution.",
+        tags=['Savings Goals'],
+        responses={
+            201: inline_serializer(
+                name='GoalContributionSuccess',
+                fields={
+                    'message': serializers.CharField(),
+                    'contribution_id': serializers.IntegerField(),
+                    'amount': serializers.DecimalField(max_digits=12, decimal_places=2),
+                    'new_saved': serializers.DecimalField(max_digits=12, decimal_places=2)
+                }
+            ),
+            400: {'description': 'Goal completed or exceeds target amount.'},
+            404: {'description': 'Goal not found.'}
+        }
+    )
+    @idempotent_request
+    @transaction.atomic
     def post(self, request, goal_id):
         try:
-            goal = SavingsGoal.objects.get(id=goal_id, user=request.user)
+            goal = SavingsGoal.objects.select_for_update().get(id=goal_id, user=request.user)
         except SavingsGoal.DoesNotExist:
             return Response(
                 {"error": "Goal not found or you do not own it."},
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Check if goal is already completed
         current_saved = goal.current_saved
+
+        # Check if goal is already completed
         if current_saved >= goal.target_amount:
             return Response(
-                {
-                    "error": "This goal has already been completed. No further contributions allowed."
-                },
+                {"error": "This goal is already completed."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        potential_new_saved = current_saved + goal.regular_contribution
-        if potential_new_saved > goal.target_amount:
+        contribution_amount = goal.regular_contribution
+        if (current_saved + contribution_amount) > goal.target_amount:
             remaining = goal.target_amount - current_saved
             return Response(
                 {
-                    "error": f"Cannot contribute full amount. Only ₵{remaining} needed to complete goal.",
-                    "remaining_needed": float(remaining)
+                    "error": f"Amount exceeds target. Only ₵{remaining} needed.",
+                    "remaining_needed": remaining
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Record the contribution
         contribution = GoalContribution.objects.create(
             goal=goal,
-            amount=goal.regular_contribution,
-            # Manual now; will be False + webhook later
+            amount=contribution_amount,
             is_verified=True
         )
 
         goal.last_contribution_date = timezone.now().date()
         goal.save(update_fields=['last_contribution_date'])
 
+        # Record in Immutable Ledger (single-sided credit to personal wallet)
+        LedgerService.create_entry(
+            user=request.user,
+            actor=request.user,
+            amount=contribution.amount,
+            direction='debit',
+            transaction_type='goal_contribution',
+            description=f"Deposit to goal: {goal.name}",
+            reference=f"GOAL-{contribution.id}-{uuid.uuid4().hex[:8]}",
+            request_id=getattr(request, 'request_id', None),
+            related_goal=goal,
+        )
+
+        logger.info({
+            "event": "goal_contribution_recorded",
+            "user_id": request.user.id,
+            "goal_id": goal.id,
+            "amount": str(contribution.amount),
+            "request_id": getattr(request, 'request_id', None)
+        })
+
         return Response({
             "message": "Contribution recorded successfully",
             "contribution_id": contribution.id,
-            "amount": float(contribution.amount),
-            "new_saved": float(goal.current_saved)
+            "amount": contribution.amount,
+            "new_saved": goal.current_saved
         }, status=status.HTTP_201_CREATED)
-
 
 @extend_schema(
     methods=['GET'],
@@ -948,40 +1107,39 @@ class GoalDetailView(RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
-@extend_schema(
-    description=(
-        "Provides aggregated statistics for the 'Groups' page cards: "
-        "- Total Groups: Count of active groups the authenticated user is a member of. "
-        "- Total Members: Sum of members across those active groups. "
-        "- Group Savings: Sum of verified contributions in the current cycle (current 'pot') across those groups."
-    ),
-    tags=['Savings Groups'],
-    responses={
-        200: GroupsStatsResponseSerializer,
-        401: {'description': 'Authentication required.'}
-    }
-)
 class GroupsStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        description="Provides aggregated statistics for the user's active groups.",
+        tags=['Savings Groups'],
+        responses={
+            200: GroupsStatsResponseSerializer,
+            401: {'description': 'Authentication required.'}
+        }
+    )
     def get(self, request):
         user = request.user
+
+        # Fetch active groups where user is a member
         active_groups = SavingsGroup.objects.filter(
-            members__user=user,
+            memberships__user=user,
             status='active'
         ).distinct()
 
         total_groups = active_groups.count()
 
+        # Sum members across these groups
         total_members = active_groups.aggregate(
             total_members=Sum('current_members')
         )['total_members'] or 0
 
-        # Compute combined current savings (sum of current cycle verified contributions per group)
-        # Loop is acceptable as users typically join few groups (<10); optimizes for readability.
+        # Calculate 'Current Pot' across all groups
         group_savings = Decimal('0.00')
-        for group in active_groups:
+
+        for group in active_groups.only('start_date', 'payout_interval_days', 'frequency'):
             current_cycle = group.current_cycle_number
+
             cycle_total = Contribution.objects.filter(
                 membership__group=group,
                 cycle_number=current_cycle,
@@ -989,12 +1147,13 @@ class GroupsStatsView(APIView):
             ).aggregate(
                 total=Sum('amount')
             )['total'] or Decimal('0.00')
+
             group_savings += cycle_total
 
         return Response({
             'total_groups': total_groups,
             'total_members': total_members,
-            'group_savings': float(group_savings)
+            'group_savings': group_savings
         })
 
 @extend_schema(
