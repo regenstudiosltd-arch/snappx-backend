@@ -11,7 +11,7 @@ load_dotenv(BASE_DIR / '.env')
 
 # SECURITY
 SECRET_KEY = config('SECRET_KEY')
-DEBUG = config('DEBUG', default=True, cast=bool)
+DEBUG = config('DEBUG', default=False, cast=bool)
 DJANGO_ENV = config('DJANGO_ENV', default='development')
 
 # ALLOWED_HOSTS = config(
@@ -42,11 +42,14 @@ INSTALLED_APPS = [
     'qrcode',
     'drf_spectacular',
     'django_filters',
+    'auditlog',
+    'accounts.apps.AccountsConfig',
 
-    'accounts',
+    # 'accounts',
 ]
 
 MIDDLEWARE = [
+    'core.middleware.RequestIDMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -54,6 +57,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'auditlog.middleware.AuditlogMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -169,7 +173,7 @@ REST_FRAMEWORK = {
 # }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(hours=8),  # Example: 8 hours (good balance)
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=5),
     # Or timedelta(minutes=120) for 2 hours
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),  # Optional: extend refresh too
     'UPDATE_LAST_LOGIN': True,
@@ -247,6 +251,9 @@ CELERY_TIMEZONE = 'Africa/Accra'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_BROKER_TRANSPORT_OPTIONS = {'visibility_timeout': 3600}
 
 # # Periodic Task Scheduling
 # CELERY_BEAT_SCHEDULE = {
@@ -265,16 +272,39 @@ CELERY_RESULT_SERIALIZER = 'json'
 #     },
 # }
 
+# CELERY_BEAT_SCHEDULE = {
+#     'process-daily-payouts': {
+#         'task': 'accounts.tasks.process_daily_payouts',
+#         'schedule': timedelta(minutes=3),
+#         'options': {'queue': 'default'},
+#     },
+#     'send-goal-reminders': {
+#         'task': 'accounts.tasks.send_goal_reminders',
+#         'schedule': timedelta(minutes=3),
+#         'options': {'queue': 'default'},
+#     },
+# }
+
+
 CELERY_BEAT_SCHEDULE = {
-    'process-daily-payouts': {
+    'process-daily-payouts-at-midnight': {
         'task': 'accounts.tasks.process_daily_payouts',
-        'schedule': timedelta(minutes=3),
-        'options': {'queue': 'default'},
+        'schedule': crontab(hour=0, minute=0),
     },
-    'send-goal-reminders': {
+    # NEW: Financial Reconciliation at 3:00 AM
+    'reconcile-financial-integrity-at-3am': {
+        'task': 'accounts.tasks.reconcile_financial_integrity',
+        'schedule': crontab(hour=3, minute=0),
+    },
+    # NEW: Cleanup Idempotency Keys at 4:00 AM
+    'clear-idempotency-keys-daily': {
+        'task': 'accounts.tasks.clear_old_idempotency_keys',
+        'schedule': crontab(hour=4, minute=0),
+    },
+    # Goal Reminders at 8:00 AM
+    'send-goal-reminders-daily': {
         'task': 'accounts.tasks.send_goal_reminders',
-        'schedule': timedelta(minutes=3),
-        'options': {'queue': 'default'},
+        'schedule': crontab(hour=8, minute=0),
     },
 }
 
@@ -285,3 +315,14 @@ if ENVIRONMENT == "production":
     SITE_URL = config("SITE_URL")
 else:
     SITE_URL = "http://127.0.0.1:8000"
+
+
+# ADMINS = [
+#     ('Backend Team', 'pierres717@gmail.com'),
+# ]
+
+ADMINS = [
+    'pierres717@gmail.com',
+]
+
+FIELD_ENCRYPTION_KEY = config('FIELD_ENCRYPTION_KEY')
