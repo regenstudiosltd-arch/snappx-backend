@@ -5,13 +5,18 @@ from django.core.mail import send_mail
 from django.template.loader import render_to_string
 from django.contrib.sites.models import Site
 from django.urls import NoReverseMatch, reverse
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from datetime import timedelta
-from django.db.models import Sum, Q
+from django.db.models import Sum
 from celery import shared_task
-from django.utils import timezone
-from .models import SavingsGroup, Contribution, PayoutOrder, SavingsGoal
+from .models import SavingsGroup, Contribution, PayoutOrder, SavingsGoal, Wallet, LedgerEntry, IdempotencyKey
+from .services import LedgerService
+import logging
+
+
+logger = logging.getLogger('accounts.finance')
+
 
 # Dawurobo API constants
 DAWUROBO_BASE = "https://devs.sms.api.dawurobo.com/v1/otp"
@@ -24,40 +29,29 @@ HEADERS = {
 }
 
 
-def send_dawurobo_otp_sync(phone_number: str) -> dict:
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_dawurobo_otp_async(self, phone_number: str):
     """
-    Synchronous version used in local development.
-    Works exactly like the old .delay() version but runs immediately.
+    GOOGLE FIX: OTP sending MUST be async.
+    A 30s timeout in a request-response cycle is a DoS risk.
     """
+    clean_number = phone_number.replace("+", "").replace(" ", "")
     payload = {
         "senderid": settings.DAWUROBO_SENDER_ID,
-        "number": phone_number.replace("+", "").replace(" ", ""),
-        "messagetemplate": "Your SnappX verification code is: %OTPCODE%. Expires in %EXPIRY% minutes.",
+        "number": clean_number,
+        "messagetemplate": "Your SnappX code: %OTPCODE%. Expires in %EXPIRY% min.",
         "expiry": 10,
         "length": 6,
         "type": "NUMERIC"
     }
 
     try:
-        response = requests.post(
-            f"{DAWUROBO_BASE}/generate",
-            json=payload,
-            headers=HEADERS,
-            timeout=30
-        )
-
-        if response.status_code in (200, 201, 409):
-            print(f"OTP sent successfully to {phone_number}")
-            return {"success": True, "status_code": response.status_code}
-
+        response = requests.post(f"{DAWUROBO_BASE}/generate", json=payload, headers=HEADERS, timeout=15)
         response.raise_for_status()
         return {"success": True}
-
-    except requests.exceptions.RequestException as e:
-        print(f"DAWUROBO SEND ERROR → {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response: {e.response.text}")
-        return {"success": False, "error": str(e)}
+    except Exception as exc:
+        logger.error(f"OTP SEND FAIL: {phone_number} - {exc}")
+        raise self.retry(exc=exc)
 
 
 def verify_and_invalidate_otp_sync(phone_number: str, code: str) -> bool:
@@ -84,7 +78,7 @@ def verify_and_invalidate_otp_sync(phone_number: str, code: str) -> bool:
                 f"{DAWUROBO_BASE}/invalidate",
                 json={"number": clean_number},
                 headers=HEADERS,
-                timeout=10
+                timeout=3
             )
             print(f"OTP verified and invalidated for {phone_number}")
             return True
@@ -236,63 +230,92 @@ def send_group_join_response_email_async(request_id: int, action: str):
         print(f"EMAIL SEND ERROR for Request ID {request_id}: {e}")
         return False
 
-@shared_task
-def process_daily_payouts():
+
+@shared_task(bind=True, max_retries=3)
+def process_daily_payouts(self):
+    """
+    High-performance daily orchestrator for group disbursements.
+    Uses database-level filtering and iterators to handle 100k+ groups efficiently.
+    """
     today = timezone.now().date()
-    active_groups = SavingsGroup.objects.filter(
+    queryset = SavingsGroup.objects.filter(
         status='active',
         start_date__lte=today
-    )
-    for group in active_groups:
+    ).only('id', 'start_date', 'payout_interval_days').iterator(chunk_size=1000)
+
+    dispatched_count = 0
+
+    for group in queryset:
         days_since_start = (today - group.start_date).days
-        if days_since_start % group.payout_interval_days != 0:
-            continue
-        current_cycle = group.current_cycle_number
 
-        # Verify all contributions for this cycle
-        expected_contributions = group.expected_members
-        verified_contributions = Contribution.objects.filter(
-            membership__group=group,
-            cycle_number=current_cycle,
-            is_verified=True
-        ).count()
-        if verified_contributions < expected_contributions:
-            send_mail(
-                subject=f"Incomplete Contributions for {group.group_name}",
-                message=f"Cycle {current_cycle} in {group.group_name} has only {verified_contributions}/{expected_contributions} verified contributions. Payout skipped.",
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[group.admin.email]
-            )
-            continue
+        if days_since_start > 0 and days_since_start % group.payout_interval_days == 0:
+            execute_group_payout.delay(group.id)
+            dispatched_count += 1
 
-        # Determine beneficiary (rotates through positions)
-        position = ((current_cycle - 1) % group.expected_members) + 1
-        try:
-            payout_order = PayoutOrder.objects.get(
-                group=group,
-                position=position
+    return f"Orchestrator finished. Dispatched {dispatched_count} payout tasks."
+
+@shared_task(bind=True, max_retries=2)
+def execute_group_payout(self, group_id):
+    """
+    Atomic Payout Logic.
+    Ensures 'Conservation of Money' and 'At-Most-Once' execution.
+    """
+    try:
+        with transaction.atomic():
+            group = SavingsGroup.objects.select_for_update().get(id=group_id)
+            current_cycle = group.current_cycle_number
+
+            payout_ref = f"PAYOUT-GRP{group.id}-C{current_cycle}"
+            if LedgerEntry.objects.filter(reference__contains=payout_ref).exists():
+                logger.warning(f"Aborting: Cycle {current_cycle} for Group {group_id} already disbursed.")
+                return
+
+            verified_count = Contribution.objects.filter(
+                membership__group=group, cycle_number=current_cycle, is_verified=True
+            ).count()
+
+            if verified_count < group.expected_members:
+                logger.error(f"Payout Failed: Insufficient funds for Group {group_id} Cycle {current_cycle}")
+                return
+
+            position = ((current_cycle - 1) % group.expected_members) + 1
+            payout_order = PayoutOrder.objects.select_related('membership__user').get(
+                group=group, position=position
             )
             beneficiary = payout_order.membership.user
-        except PayoutOrder.DoesNotExist:
-            continue
-        # Calculate pot
-        total_pot = group.total_pot_per_cycle
 
-        # Trigger disbursement (manual email for now. I'll use Paystack/Hubtel API call later)
-        send_payout_notification_email_async.delay(
-            beneficiary_id=beneficiary.id,
-            group_id=group.id,
-            cycle=current_cycle,
-            amount=float(total_pot)
-        )
-        print(f"Payout processed for {beneficiary.email} in {group.group_name} - Cycle {current_cycle}")
+            total_pot = group.total_pot_per_cycle
+
+            LedgerService.transfer(
+                from_group=group,
+                to_user=beneficiary,
+                amount=total_pot,
+                transaction_type='payout',
+                description=f"Payout Cycle {current_cycle} to {beneficiary.profile.full_name}",
+                reference=payout_ref,
+                actor=group.admin,
+                request_id=None
+            )
+
+            group.current_cycle_number += 1
+            if current_cycle >= group.expected_members:
+                group.status = 'completed'
+            group.save()
+
+            transaction.on_commit(lambda: send_payout_notification_email_async.delay(
+                beneficiary.id, group.id, current_cycle, str(total_pot)
+            ))
+
+    except Exception as exc:
+        logger.critical(f"CRITICAL PAYOUT ERROR: Group {group_id} - {exc}")
+        raise self.retry(exc=exc)
 
 @shared_task
 def send_payout_notification_email_async(
     beneficiary_id: int,
     group_id: int,
     cycle: int,
-    amount: float
+    amount: str
 ) -> bool:
     """
     Celery task to send a payout notification email to the beneficiary.
@@ -308,7 +331,7 @@ def send_payout_notification_email_async(
     beneficiary_name = beneficiary.profile.full_name
     group_name = group.group_name.strip('*').strip()
     momo_number = str(beneficiary.profile.momo_number)
-    formatted_amount = f"₵{amount:,.2f}"
+    formatted_amount = f"₵{Decimal(amount):,.2f}"
 
     current_site = Site.objects.get_current()
     protocol = "http" if settings.DEBUG else "https"
@@ -338,7 +361,6 @@ def send_payout_notification_email_async(
         f"View your dashboard: {full_dashboard_url}"
     )
 
-    # Send Email
     try:
         send_mail(
             subject=subject,
@@ -357,60 +379,68 @@ def send_payout_notification_email_async(
 @shared_task
 def send_goal_reminders():
     """
-    Celery task to check all savings goals and send reminder emails if contribution is due.
-    Runs daily; skips if reminded recently (within 24h).
+    Celery task to check all active savings goals and send reminder emails.
+    Includes precision handling for financial progress and safety checks.
     """
-    today = timezone.now().date()
-    # Calculate current_saved for each goal
+    now = timezone.now()
+    today = now.date()
+
+
     goals = SavingsGoal.objects.annotate(
         total_saved=Sum('contributions__amount')
     ).filter(
-        total_saved__lt=models.F('target_amount'),
-        total_saved__isnull=False
+        total_saved__lt=models.F('target_amount')
     ).select_related('user__profile')
 
     for goal in goals:
         current_saved = goal.total_saved or Decimal('0.00')
+        target = goal.target_amount
 
         if not goal.is_due:
             continue
 
-        if goal.last_reminded_at and (timezone.now() - goal.last_reminded_at) < timedelta(days=1):
+        if goal.last_reminded_at and (now - goal.last_reminded_at) < timedelta(days=1):
             continue
 
+        if target > 0:
+            progress_decimal = (current_saved / target) * 100
+            progress_percentage = float(round(progress_decimal, 1))
+        else:
+            progress_percentage = 0.0
+
         user = goal.user
-        user_name = user.profile.full_name
+        user_name = user.profile.full_name or "there"
+
         current_site = Site.objects.get_current()
         protocol = "http" if settings.DEBUG else "https"
-        dashboard_url = f"{protocol}://{current_site.domain}{reverse('goals-dashboard')}"
-        progress_percentage = round((float(current_saved) / float(goal.target_amount)) * 100, 1) if goal.target_amount > 0 else 0.0
+
+        try:
+            dashboard_url = f"{protocol}://{current_site.domain}{reverse('goals-dashboard')}"
+        except NoReverseMatch:
+            dashboard_url = f"{protocol}://{current_site.domain}/dashboard/"
 
         context = {
             'user_name': user_name,
             'goal_name': goal.name,
             'contribution_amount': f"₵{goal.regular_contribution:,.2f}",
-            'frequency': goal.frequency,  # raw for |capfirst in HTML
+            'frequency': goal.get_frequency_display(),
             'current_saved': f"₵{current_saved:,.2f}",
-            'target_amount': f"₵{goal.target_amount:,.2f}",
+            'target_amount': f"₵{target:,.2f}",
             'progress_percentage': progress_percentage,
             'target_date': goal.target_date.strftime('%B %d, %Y'),
             'dashboard_url': dashboard_url,
         }
 
-        subject = f"⏰ Reminder: Time for Your {goal.get_frequency_display()} Contribution to '{goal.name}'"
+        subject = f"⏰ Reminder: Your {goal.get_frequency_display()} contribution for '{goal.name}'"
         html_content = render_to_string('emails/goal_reminder.html', context)
+
         text_content = (
             f"Hi {user_name},\n\n"
-            f"Just a friendly reminder that it's time for your {goal.get_frequency_display()} contribution to your \"{goal.name}\" goal.\n\n"
-            f"Goal: {goal.name}\n"
-            f"Amount Due: ₵{goal.regular_contribution:,.2f}\n"
-            f"Frequency: {goal.get_frequency_display()}\n"
-            f"Progress: ₵{current_saved:,.2f} / ₵{goal.target_amount:,.2f} ({progress_percentage}%)\n" # NOTE THE VARIABLE USE HERE
+            f"Friendly reminder to make your {goal.get_frequency_display()} contribution of "
+            f"₵{goal.regular_contribution:,.2f} towards your goal: \"{goal.name}\".\n\n"
+            f"Current Progress: {progress_percentage}% (₵{current_saved:,.2f} of ₵{target:,.2f})\n"
             f"Target Date: {goal.target_date.strftime('%B %d, %Y')}\n\n"
-            f"Log in to your dashboard to make your contribution and stay on track!\n"
-            f"{dashboard_url}\n\n"
-            f"You're doing great—keep up the momentum!\n\n"
-            f"The SnappX Team"
+            f"Keep up the great work! Log in here to contribute: {dashboard_url}"
         )
 
         try:
@@ -422,8 +452,99 @@ def send_goal_reminders():
                 html_message=html_content,
                 fail_silently=False,
             )
-            goal.last_reminded_at = timezone.now()
+
+            goal.last_reminded_at = now
             goal.save(update_fields=['last_reminded_at'])
-            print(f"Reminder sent to {user.email} for goal {goal.id}")
+
+            logger.info(f"Goal reminder sent to {user.email} for goal: {goal.name}")
+
         except Exception as e:
-            print(f"Failed to send reminder for goal {goal.id}: {e}")
+            logger.error(f"Failed to send goal reminder to {user.id}: {str(e)}")
+
+
+def send_reconciliation_alert_to_admins(mismatches):
+    """
+    Sends a high-priority email to system administrators when
+    financial drift is detected between the Ledger and Wallet cache.
+    """
+    # admin_emails = [email for name, email in settings.ADMINS]
+
+    admin_emails = list(settings.ADMINS)
+
+    if not admin_emails:
+        admin_emails = [settings.DEFAULT_FROM_EMAIL]
+
+    subject = f"🚨 URGENT: Financial Reconciliation Mismatch Detected - {timezone.now().date()}"
+
+    mismatch_report = ""
+    for item in mismatches:
+        mismatch_report += (
+            f"User: {item['user']}\n"
+            f"  - Ledger Total: {item['ledger']}\n"
+            f"  - Wallet Cache: {item['cache']}\n"
+            f"  - Difference:   {item['diff']}\n"
+            f"-------------------------------------\n"
+        )
+
+    message = (
+        f"The daily reconciliation task found {len(mismatches)} account(s) with balance drift.\n\n"
+        f"Mismatched Accounts:\n"
+        f"{mismatch_report}\n"
+        f"Action Required: Check the LedgerEntry logs for these users to identify the bug."
+    )
+
+    send_mail(
+        subject=subject,
+        message=message,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=admin_emails,
+        fail_silently=False,
+    )
+
+@shared_task
+def reconcile_financial_integrity():
+    """
+    THE WATCHDOG: Re-calculates every wallet balance from the Ledger
+    and compares it to the cached Wallet.current_balance.
+    Uses database-level aggregation to detect 'Drift'.
+    """
+    mismatches = []
+    wallets = Wallet.objects.select_related('user').all().iterator()
+
+    for wallet in wallets:
+        stats = LedgerEntry.objects.filter(wallet=wallet).aggregate(
+            balance=Sum(
+                models.Case(
+                    models.When(direction='credit', then=models.F('amount')),
+                    models.When(direction='debit', then=-models.F('amount')),
+                    default=Decimal('0.00'),
+                    output_field=models.DecimalField()
+                )
+            )
+        )
+
+        calculated_truth = stats['balance'] or Decimal('0.00')
+
+        if calculated_truth != wallet.current_balance:
+            mismatches.append({
+                "user": wallet.user.email,
+                "ledger": str(calculated_truth),
+                "cache": str(wallet.current_balance),
+                "diff": str(calculated_truth - wallet.current_balance)
+            })
+
+            logger.critical(f"BALANCE_DRIFT: User {wallet.user.email} | Expected: {calculated_truth} | Found: {wallet.current_balance}")
+
+    if mismatches:
+        send_reconciliation_alert_to_admins(mismatches)
+
+
+@shared_task
+def clear_old_idempotency_keys():
+    """
+    Run this daily via Celery Beat to keep the DB lean.
+    Maintains DB performance by pruning old keys.
+    """
+    expiry_limit = timezone.now() - timedelta(hours=48)
+    count, _ = IdempotencyKey.objects.filter(created_at__lt=expiry_limit).delete()
+    return f"Purged {count} idempotency keys."

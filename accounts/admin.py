@@ -2,11 +2,11 @@ from .models import GoalContribution, GroupAdminKYC, PayoutOrder, SavingsGoal, S
 from django.utils.html import format_html
 from django.utils import timezone
 from django.contrib import admin
-import cloudinary
+from django.db import transaction
 
 @admin.register(GroupAdminKYC)
 class GroupAdminKYCAdmin(admin.ModelAdmin):
-    list_display = ['user', 'is_manually_verified', 'created_at', 'verification_status']
+    list_display = ['user', 'verification_status', 'created_at']
     list_filter = ['is_manually_verified', 'created_at']
     search_fields = ['user__email', 'user__profile__momo_number']
 
@@ -35,63 +35,37 @@ class GroupAdminKYCAdmin(admin.ModelAdmin):
 
     def save_model(self, request, obj, form, change):
         if obj.is_manually_verified and not obj.verified_at:
-            obj.verified_by = request.user
-            obj.verified_at = timezone.now()
-        super().save_model(request, obj, form, change)
-
-    # generate signed URLs for private images
-    def _get_signed_url(self, image_field):
-        """
-        Explicitly builds a signed URL for private Cloudinary resources.
-        """
-        if not image_field:
-            return None
-
-        try:
-            return cloudinary.CloudinaryImage(image_field.public_id).build_url(
-                type='private',
-                sign_url=True,
-                secure=True,
-                expires_in=3600
-            )
-        except Exception as e:
-            return None
+            obj.approve(admin_user=request.user)
+        else:
+            super().save_model(request, obj, form, change)
 
     def front_preview(self, obj):
-        url = self._get_signed_url(obj.ghana_card_front)
-        if url:
-            return format_html(
-                '<a href="{}" target="_blank"><img src="{}" width="400" style="border-radius:8px; border: 2px solid #ccc;"/></a>',
-                url, url
-            )
-        return "No Front Image"
-
+        url = obj.ghana_card_front_signed_url
+        return self._image_tag(url)
     front_preview.short_description = "Ghana Card Front"
 
     def back_preview(self, obj):
-        url = self._get_signed_url(obj.ghana_card_back)
-        if url:
-            return format_html(
-                '<a href="{}" target="_blank"><img src="{}" width="400" style="border-radius:8px; border: 2px solid #ccc;"/></a>',
-                url, url
-            )
-        return "No Back Image"
-
+        url = obj.ghana_card_back_signed_url
+        return self._image_tag(url)
     back_preview.short_description = "Ghana Card Back"
 
     def live_preview(self, obj):
-        url = self._get_signed_url(obj.live_photo)
-        if url:
-            return format_html(
-                '<a href="{}" target="_blank"><img src="{}" width="400" style="border-radius:8px; border: 2px solid #007bff;"/></a>',
-                url, url
-            )
-        return "No Live Selfie"
-
+        url = obj.live_photo_signed_url
+        return self._image_tag(url, color="#007bff")
     live_preview.short_description = "Live Selfie"
 
+    def _image_tag(self, url, color="#ccc"):
+        if not url:
+            return "No Image Uploaded"
+        return format_html(
+            '<a href="{}" target="_blank">'
+            '<img src="{}" width="400" style="border-radius:8px; border: 2px solid {};"/>'
+            '</a>',
+            url, url, color
+        )
+
     def verification_status(self, obj):
-        return "✅ Verified" if obj.is_manually_verified else "❌ Pending"
+        return format_html('<b style="color: green;">✅ Verified</b>') if obj.is_manually_verified else format_html('<b style="color: red;">❌ Pending</b>')
 
 @admin.register(SavingsGroup)
 class SavingsGroupAdmin(admin.ModelAdmin):
@@ -101,27 +75,33 @@ class SavingsGroupAdmin(admin.ModelAdmin):
     readonly_fields = ['admin', 'created_at', 'approved_at']
     actions = ['approve_groups', 'suspend_groups', 'reject_groups']
 
+    @transaction.atomic
     def approve_groups(self, request, queryset):
-        queryset.update(status='active', approved_by=request.user, approved_at=timezone.now())
-        for group in queryset:
-            group.admin.kyc.is_manually_verified = True
-            group.admin.kyc.verified_by = request.user
-            group.admin.kyc.verified_at = timezone.now()
-            group.admin.kyc.save()
 
-            # Activation logic if group is full
+        updated_count = 0
+        for group in queryset:
+            group.status = 'active'
+            group.approved_by = request.user
+            group.approved_at = timezone.now()
+
+            if hasattr(group.admin, 'kyc'):
+                group.admin.kyc.approve(admin_user=request.user)
+
             if group.current_members >= group.expected_members and not group.start_date:
                 group.start_date = timezone.now().date()
-                group.save(update_fields=['start_date'])
 
-                # Generate payout order based on join order (earliest first)
                 memberships = group.members.order_by('joined_at')
                 for pos, membership in enumerate(memberships, start=1):
-                    PayoutOrder.objects.create(
+                    PayoutOrder.objects.get_or_create(
                         group=group,
                         membership=membership,
-                        position=pos
+                        defaults={'position': pos}
                     )
+
+            group.save()
+            updated_count += 1
+
+        self.message_user(request, f"Successfully activated {updated_count} groups and their admins.")
 
     approve_groups.short_description = "Approve and activate selected groups (if full)"
 
@@ -147,6 +127,7 @@ class GroupMembershipAdmin(admin.ModelAdmin):
     list_filter = ['joined_at']
     search_fields = ['user__email', 'group__group_name']
     readonly_fields = ['user', 'group', 'joined_at']
+
 @admin.register(SavingsGoal)
 class SavingsGoalAdmin(admin.ModelAdmin):
     list_display = ['name', 'user', 'target_amount', 'frequency', 'target_date', 'created_at']
