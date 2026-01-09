@@ -1,17 +1,37 @@
+import os
+import uuid
 from decimal import Decimal
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from cloudinary.models import CloudinaryField
-from django.db import models
-import os
 from django.core.validators import MinValueValidator
 from django.db.models import Sum
 from dateutil.relativedelta import relativedelta
 import datetime
 from django.utils import timezone
+from django.conf import settings
+from encrypted_model_fields.fields import EncryptedCharField
+import hashlib
+import phonenumbers
+import cloudinary.uploader
+import cloudinary.utils
+from django.db import models, transaction
+from django.contrib.auth.models import User
 
+class SoftDeleteModel(models.Model):
+    """Base class to prevent hard-deleting critical data."""
+    is_active = models.BooleanField(default=True, db_index=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+    def delete(self, *args, **kwargs):
+        self.is_active = False
+        self.deleted_at = timezone.now()
+        self.save()
 
 class User(AbstractUser):
     email = models.EmailField(unique=True, db_index=True)
@@ -23,13 +43,17 @@ class User(AbstractUser):
 
     groups = models.ManyToManyField(
         'auth.Group',
-        related_name='custom_user_set',
+        related_name='custom_user_groups',
         blank=True,
+        help_text='The groups this user belongs to.',
+        verbose_name='groups',
     )
     user_permissions = models.ManyToManyField(
         'auth.Permission',
-        related_name='custom_user_set',
+        related_name='custom_user_permissions',
         blank=True,
+        help_text='Specific permissions for this user.',
+        verbose_name='user permissions',
     )
 
 
@@ -51,8 +75,28 @@ class Profile(models.Model):
     )
     profile_picture = models.URLField(max_length=1000, blank=True, null=True, verbose_name="Profile Picture URL")
     momo_provider = models.CharField(max_length=20, choices=MOMO_PROVIDER_CHOICES)
-    momo_number = PhoneNumberField(unique=True)
+    momo_number = EncryptedCharField(max_length=255)
+    momo_number_hash = models.CharField(max_length=128, unique=True, db_index=True, editable=False)
     momo_name = models.CharField(max_length=255)
+
+    def save(self, *args, **kwargs):
+        if self.momo_number:
+            try:
+                parsed_num = phonenumbers.parse(self.momo_number, "GH")
+                if phonenumbers.is_valid_number(parsed_num):
+                    normalized = phonenumbers.format_number(parsed_num, phonenumbers.PhoneNumberFormat.E164)
+                else:
+                    normalized = self.momo_number.strip()
+            except Exception:
+                normalized = self.momo_number.strip()
+
+            salt = getattr(settings, "HASH_SALT", settings.SECRET_KEY)
+            hash_input = f"{normalized}{salt}".encode('utf-8')
+            self.momo_number_hash = hashlib.sha256(hash_input).hexdigest()
+
+            self.momo_number = normalized
+
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.full_name
@@ -94,6 +138,58 @@ class GroupAdminKYC(models.Model):
     verified_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='verified_kycs')
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def __str__(self):
+        return f"KYC for {self.user.email}"
+
+    def _get_signed_url(self, field):
+        """Generates a temporary signed URL for admin viewing."""
+        if not field:
+            return None
+
+        url, options = cloudinary.utils.cloudinary_url(
+            field.public_id,
+            sign_url=True,
+            type="private",
+            secure=True,
+            expires_at=int((timezone.now() + timezone.timedelta(minutes=30)).timestamp())
+        )
+        return url
+
+    @property
+    def ghana_card_front_signed_url(self):
+        return self._get_signed_url(self.ghana_card_front)
+
+    @property
+    def ghana_card_back_signed_url(self):
+        return self._get_signed_url(self.ghana_card_back)
+
+    @property
+    def live_photo_signed_url(self):
+        return self._get_signed_url(self.live_photo)
+
+
+    @transaction.atomic
+    def approve(self, admin_user):
+        """Strict atomic method for manual verification."""
+        self.is_manually_verified = True
+        self.verified_at = timezone.now()
+        self.verified_by = admin_user
+        self.save(update_fields=['is_manually_verified', 'verified_at', 'verified_by'])
+
+        user = self.user
+        if hasattr(user, 'is_verified'):
+            user.is_verified = True
+            user.save(update_fields=['is_verified'])
+
+
+    def delete(self, *args, **kwargs):
+        """Ensure physical images are deleted from Cloudinary when record is removed."""
+        for field_name in ['ghana_card_front', 'ghana_card_back', 'live_photo']:
+            image_field = getattr(self, field_name)
+            if image_field:
+                cloudinary.uploader.destroy(image_field.public_id, type="private")
+        super().delete(*args, **kwargs)
+
 class SavingsGroup(models.Model):
     FREQUENCY_CHOICES = (
         ('daily', 'Daily'),
@@ -118,6 +214,11 @@ class SavingsGroup(models.Model):
         help_text="Computed from frequency: daily=1, weekly=7, monthly≈30"
     )
 
+    current_cycle_number = models.PositiveIntegerField(
+        default=1,
+        help_text="The actual cycle the group is in. Incremented manually on payout."
+    )
+
     def save(self, *args, **kwargs):
         if self.frequency == 'daily':
             self.payout_interval_days = 1
@@ -133,38 +234,26 @@ class SavingsGroup(models.Model):
 
     @property
     def next_payout_date(self):
-        if not self.start_date:
-            return None
-        today = timezone.now().date()
-        days_since_start = (today - self.start_date).days
-        cycle_length = self.payout_interval_days
-
-        # Next payout is at the end of the current cycle
-        days_into_current_cycle = days_since_start % cycle_length
-        days_to_next_payout = cycle_length - days_into_current_cycle
-
-        # If exactly on payout day, next one is in full cycle
-        if days_to_next_payout == 0:
-            days_to_next_payout = cycle_length
-
-        return today + datetime.timedelta(days=days_to_next_payout)
+        if not self.start_date: return None
+        return self.start_date + datetime.timedelta(days=self.current_cycle_number * self.payout_interval_days)
 
     @property
     def days_until_next_payout(self):
-        if not self.next_payout_date:
+        """
+        Returns the countdown from today to the next_payout_date.
+        """
+        target = self.next_payout_date
+        if not target:
             return None
+
         today = timezone.now().date()
-        days_left = (self.next_payout_date - today).days
-        return days_left if days_left > 0 else 0  # today = 0, not negative
+        diff = (target - today).days
+        return max(0, diff)
 
     @property
-    def current_cycle_number(self):
-        if not self.start_date:
-            return 0
-        # Use timezone.now() from django.utils
-        days_since_start = (timezone.now().date() - self.start_date).days
-        return (days_since_start // self.payout_interval_days) + 1
-
+    def current_cycle_end_date(self):
+        """Optional: The deadline for contributions for the current cycle"""
+        return self.next_payout_date
 
     name = models.CharField(max_length=255)
     admin = models.ForeignKey(User, on_delete=models.PROTECT, related_name='admin_of_groups')
@@ -264,7 +353,7 @@ class GroupMembership(models.Model):
     group = models.ForeignKey(
         'SavingsGroup',
         on_delete=models.CASCADE,
-        related_name='members',
+        related_name='memberships',
         help_text="The group the user is a member of."
     )
     joined_at = models.DateTimeField(auto_now_add=True)
@@ -298,6 +387,7 @@ class PayoutOrder(models.Model):
         ordering = ['position']
 
 class Contribution(models.Model):
+    """Record of a specific group payment."""
     membership = models.ForeignKey(GroupMembership, on_delete=models.PROTECT, related_name='contributions')
     amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
     cycle_number = models.PositiveIntegerField()
@@ -320,7 +410,7 @@ class SavingsGoal(models.Model):
     regular_contribution = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
     target_date = models.DateField()
     frequency = models.CharField(max_length=20, choices=FREQUENCY_CHOICES)
-    last_contribution_date = models.DateField(null=True, blank=True)  # Updated on contribution
+    last_contribution_date = models.DateField(null=True, blank=True)
     last_reminded_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -331,21 +421,27 @@ class SavingsGoal(models.Model):
         return f"{self.name} for {self.user.email}"
 
     def clean(self):
-        if self.target_date < timezone.now().date():
+        if self.target_date and self.target_date < timezone.now().date():
             raise ValidationError("Target date must be in the future.")
         if self.target_amount <= 0:
             raise ValidationError("Target amount must be positive.")
 
     @property
     def current_saved(self):
-        total = self.contributions.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        """
+        Calculates only VERIFIED savings.
+        """
+        total = self.contributions.filter(is_verified=True).aggregate(
+            total=Sum('amount')
+        )['total'] or Decimal('0.00')
         return total
 
     @property
     def progress_percentage(self):
         if self.target_amount == 0:
-            return 0.0
-        return float((self.current_saved / self.target_amount) * 100)
+            return Decimal('0.00')
+        percentage = (self.current_saved / self.target_amount) * 100
+        return percentage.quantize(Decimal('0.01'))
 
     @property
     def days_left(self):
@@ -361,7 +457,6 @@ class SavingsGoal(models.Model):
     @property
     def is_due(self):
         if not self.last_contribution_date:
-            # First contribution is always due
             return True
 
         today = timezone.now().date()
@@ -379,6 +474,10 @@ class SavingsGoal(models.Model):
 
     @property
     def is_active(self):
+        """
+        A goal is active if it hasn't reached its target and hasn't expired.
+        Uses verified savings to check completion.
+        """
         return self.current_saved < self.target_amount and self.target_date >= timezone.now().date()
 
 class GoalContribution(models.Model):
@@ -389,3 +488,133 @@ class GoalContribution(models.Model):
 
     class Meta:
         ordering = ['-paid_at']
+
+class IdempotencyKey(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True
+    )
+    key = models.CharField(max_length=255)
+
+    request_hash = models.CharField(
+        max_length=64,
+        help_text="SHA-256 hash of the request body to ensure integrity.",
+        db_index=True,
+    )
+
+    response_code = models.IntegerField()
+    response_body = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'key')
+        verbose_name = "Idempotency Key"
+        verbose_name_plural = "Idempotency Keys"
+        indexes = [
+            models.Index(fields=['user', 'key']),
+            models.Index(fields=['created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.key}"
+
+
+class Wallet(models.Model):
+    """
+    Acts as an internal account.
+    Can belong to a human User (Personal Wallet)
+    or a SavingsGroup (Group Pot).
+    """
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='wallet',
+        null=True, blank=True
+    )
+    group = models.OneToOneField(
+        'SavingsGroup',
+        on_delete=models.PROTECT,
+        related_name='group_wallet',
+        null=True, blank=True
+    )
+
+    currency = models.CharField(max_length=3, default='GHS')
+    current_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def clean(self):
+        # Integrity Check: A wallet cannot belong to both or neither
+        if not self.user and not self.group:
+            raise ValidationError("Wallet must be linked to either a User or a Group.")
+        if self.user and self.group:
+            raise ValidationError("Wallet cannot be linked to both a User and a Group.")
+
+    def __str__(self):
+        owner = self.user.email if self.user else f"Group: {self.group.group_name}"
+        return f"{owner}'s Wallet ({self.currency} {self.current_balance})"
+class LedgerEntry(models.Model):
+    """
+    The Single Source of Truth.
+    Records every movement of value. Immutable.
+    """
+    TRANSACTION_TYPES = (
+        ('deposit', 'Deposit'),
+        ('withdrawal', 'Withdrawal'),
+        ('contribution', 'Group Contribution'),
+        ('goal_contribution', 'Goal Contribution'),
+        ('payout', 'Group Payout'),
+        ('refund', 'Refund'),
+    )
+
+    DIRECTION_CHOICES = (
+        ('credit', 'Credit (+, Money In)'),
+        ('debit', 'Debit (-, Money Out)'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    wallet = models.ForeignKey(Wallet, on_delete=models.PROTECT, related_name='ledger_entries')
+    actor = models.ForeignKey( User, on_delete=models.PROTECT,related_name='performed_transactions',null=True, blank=True
+    )
+
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES)
+    transaction_type = models.CharField(max_length=50, choices=TRANSACTION_TYPES)
+
+    transaction_group_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Links related entries for double-entry integrity. Null for external inflows/outflows."
+    )
+
+    description = models.CharField(max_length=255)
+    reference = models.CharField(max_length=255, unique=True, help_text="External ID or Internal UUID")
+    request_id = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+
+    related_group = models.ForeignKey('SavingsGroup', null=True, blank=True, on_delete=models.SET_NULL)
+    related_goal = models.ForeignKey('SavingsGoal', null=True, blank=True, on_delete=models.SET_NULL)
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['wallet', 'created_at']),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            # Prevent updates to existing ledger entries
+            if LedgerEntry.objects.filter(pk=self.pk).exists():
+                raise ValidationError("Ledger entries are immutable and cannot be updated.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Ledger entries cannot be deleted. Create a correcting entry instead.")
+
+    def __str__(self):
+        sign = "+" if self.direction == 'credit' else "-"
+        return f"{sign}{self.amount} ({self.transaction_type}) - {self.description}"
