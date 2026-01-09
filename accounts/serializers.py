@@ -1,3 +1,7 @@
+import os
+import html
+import hashlib
+import phonenumbers
 from time import timezone
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -10,6 +14,7 @@ from django.db.models import Sum
 from drf_spectacular.utils import extend_schema_field, OpenApiTypes
 from decimal import Decimal
 from django.utils import timezone
+from django.db import transaction
 
 User = get_user_model()
 
@@ -31,8 +36,23 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             if '@' in login_field:
                 user = User.objects.select_related('profile').get(email=login_field)
             else:
-                user = User.objects.select_related('profile').get(profile__momo_number=login_field)
-        except User.DoesNotExist:
+                try:
+                    parsed = phonenumbers.parse(login_field, "GH")
+                    if phonenumbers.is_valid_number(parsed):
+                        normalized_phone = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+                    else:
+                        normalized_phone = login_field.strip()
+                except Exception:
+                    normalized_phone = login_field.strip()
+
+                salt = getattr(settings, "HASH_SALT", settings.SECRET_KEY)
+                hash_input = f"{normalized_phone}{salt}".encode('utf-8')
+                phone_hash = hashlib.sha256(hash_input).hexdigest()
+
+                # Lookup by Hash
+                user = User.objects.select_related('profile').get(profile__momo_number_hash=phone_hash)
+
+        except (User.DoesNotExist, Profile.DoesNotExist):
             raise AuthenticationFailed('No user found with this email or phone')
 
         if not user.check_password(password):
@@ -126,8 +146,27 @@ class SignupSerializer(serializers.ModelSerializer):
 class ProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = Profile
-        fields = '__all__'
-        read_only_fields = ('user',)
+        fields = [
+            'id', 'full_name', 'date_of_birth', 'user_type',
+            'ghana_post_address', 'profile_picture',
+            'momo_provider', 'momo_number', 'momo_name'
+        ]
+
+        read_only_fields = ('id', 'user')
+
+    def validate_full_name(self, value):
+        return html.escape(value.strip())
+
+    def validate_ghana_post_address(self, value):
+        return value.strip().upper()
+
+    def validate_momo_number(self, value):
+        stripped_value = value.strip()
+        if len(stripped_value) < 9:
+            raise serializers.ValidationError("Mobile money number is too short.")
+        return stripped_value
+
+
 class SendOTPSerializer(serializers.Serializer):
     phone_number = serializers.CharField(max_length=20)
 class VerifyOTPSerializer(serializers.Serializer):
@@ -146,6 +185,7 @@ class ResetPasswordSerializer(serializers.Serializer):
         if data['password'] != data['password2']:
             raise ValidationError("Passwords don't match")
         return data
+
 class GroupAdminKYCSerializer(serializers.ModelSerializer):
     ghana_card_front = serializers.ImageField(
         required=True,
@@ -163,14 +203,45 @@ class GroupAdminKYCSerializer(serializers.ModelSerializer):
         help_text="Upload live selfie"
     )
 
+
+    ghana_card_front_url = serializers.ReadOnlyField(source='ghana_card_front_signed_url')
+    ghana_card_back_url = serializers.ReadOnlyField(source='ghana_card_back_signed_url')
+    live_photo_url = serializers.ReadOnlyField(source='live_photo_signed_url')
+
     class Meta:
         model = GroupAdminKYC
-        fields = ['ghana_card_front', 'ghana_card_back', 'live_photo']
+        fields = [
+            'ghana_card_front', 'ghana_card_back', 'live_photo',
+            'ghana_card_front_url', 'ghana_card_back_url', 'live_photo_url',
+            'is_manually_verified', 'verified_at'
+        ]
+        read_only_fields = ['is_manually_verified', 'verified_at']
+
+    def _validate_file(self, value):
+        """Shared logic to prevent 'Image Bomb' attacks and invalid formats."""
+
+        limit = 5 * 1024 * 1024
+        if value.size > limit:
+            raise serializers.ValidationError("File size too large. Maximum allowed size is 5MB.")
+
+        ext = os.path.splitext(value.name)[1].lower()
+        if ext not in ['.jpg', '.jpeg', '.png']:
+            raise serializers.ValidationError("Unsupported file format. Please upload a JPG or PNG.")
+
+        return value
+
+    def validate_ghana_card_front(self, value):
+        return self._validate_file(value)
+
+    def validate_ghana_card_back(self, value):
+        return self._validate_file(value)
+
+    def validate_live_photo(self, value):
+        return self._validate_file(value)
 
     def create(self, validated_data):
         user = self.context['request'].user
         return GroupAdminKYC.objects.create(user=user, **validated_data)
-
 class SavingsGroupCreateSerializer(serializers.ModelSerializer):
     kyc = GroupAdminKYCSerializer(required=True)
 
@@ -188,34 +259,59 @@ class SavingsGroupCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         if 'request' in self.context and self.context['request'].method == 'POST':
             user = self.context['request'].user
-
             self.kyc_exists = GroupAdminKYC.objects.filter(user=user).exists()
-
             if self.kyc_exists:
                 self.fields['kyc'].required = False
-
                 kyc_fields = self.fields['kyc'].fields
                 for field_name in kyc_fields:
                     kyc_fields[field_name].required = False
 
+
+    def validate_group_name(self, value):
+        return html.escape(value.strip())
+
+    def validate_description(self, value):
+        if value:
+            return html.escape(value.strip())
+        return value
+
+    def validate_contribution_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Contribution amount must be a positive value.")
+        if value > 50000:
+            raise serializers.ValidationError("Contribution amount exceeds maximum allowed limit.")
+        return value
+
+    def validate_expected_members(self, value):
+        if value < 2:
+            raise serializers.ValidationError("A savings group must have at least 2 members.")
+        if value > 50:
+            raise serializers.ValidationError("Maximum group size is 50 members.")
+        return value
+
+    def validate_payout_timeline_days(self, value):
+        if value < 1:
+            raise serializers.ValidationError("Payout timeline must be at least 1 day.")
+        return value
+
+
+    @transaction.atomic
     def create(self, validated_data):
-        kyc_data = validated_data.pop('kyc')
+
+        kyc_data = validated_data.pop('kyc', None)
         user = self.context['request'].user
 
+        # Handle KYC
         kyc_exists = getattr(self, 'kyc_exists', GroupAdminKYC.objects.filter(user=user).exists())
-
-        if not kyc_exists:
+        if not kyc_exists and kyc_data:
             GroupAdminKYC.objects.create(
                 user=user,
                 ghana_card_front=kyc_data.get('ghana_card_front'),
                 ghana_card_back=kyc_data.get('ghana_card_back'),
                 live_photo=kyc_data.get('live_photo')
             )
-        else:
-            pass
 
         # Create the Savings Group
         group = SavingsGroup.objects.create(
@@ -224,18 +320,21 @@ class SavingsGroupCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # Add the admin as a member of the group
+        # Add the admin as the first member
         GroupMembership.objects.create(user=user, group=group)
 
         return group
+
 class SavingsGroupSerializer(serializers.ModelSerializer):
     admin_name = serializers.CharField(source='admin.profile.full_name', read_only=True)
     admin_phone = serializers.CharField(source='admin.profile.momo_number', read_only=True)
     admin_photo = serializers.URLField(source='admin.profile.profile_picture', read_only=True, allow_null=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
 
+    total_group_savings = serializers.SerializerMethodField()
+
     total_savings = serializers.SerializerMethodField(
-        help_text="Total amount the admin (you) has personally contributed to this group across ALL cycles (historical + current)."
+        help_text="Total amount the current user has personally contributed to this group."
     )
     next_due = serializers.SerializerMethodField(
         help_text="Next payout date (end of current contribution cycle)."
@@ -248,30 +347,45 @@ class SavingsGroupSerializer(serializers.ModelSerializer):
             'payout_timeline_days', 'expected_members', 'current_members',
             'description', 'status', 'status_display', 'created_at',
             'admin_name', 'admin_phone', 'admin_photo',
-            'total_savings', 'next_due'
+            'total_savings', 'total_group_savings', 'next_due'
         ]
         read_only_fields = ['status', 'current_members', 'created_at']
 
-    @extend_schema_field(OpenApiTypes.FLOAT)
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_total_savings(self, obj):
         """
-        Returns the users total personal contributions across ALL cycles in this group.
+        Returns the users total personal contributions.
         """
         request = self.context.get('request')
         if not request or not request.user.is_authenticated:
-            return 0.0
+            return Decimal('0.00')
 
         try:
-            membership = obj.members.get(user=request.user)
-            total = membership.contributions.aggregate(total=Sum('amount'))['total']
-            return float(total or 0.0)
+            membership = obj.memberships.get(user=request.user)
+            total = membership.contributions.filter(is_verified=True).aggregate(
+                total=Sum('amount')
+            )['total']
+            return total or Decimal('0.00')
         except GroupMembership.DoesNotExist:
-            return 0.0
+            return Decimal('0.00')
+
+    @extend_schema_field(OpenApiTypes.DECIMAL)
+    def get_total_group_savings(self, obj):
+        """
+        Calculates the total amount contributed by ALL members in the group.
+        """
+        # Summing contributions from all memberships tied to this group
+        total = Contribution.objects.filter(
+            membership__group=obj,
+            is_verified=True
+        ).aggregate(total=Sum('amount'))['total']
+
+        return total or Decimal('0.00')
 
     @extend_schema_field(OpenApiTypes.STR)
     def get_next_due(self, obj):
         if obj.next_payout_date:
-            return obj.next_payout_date.strftime('%m/%d/%Y')
+            return obj.next_payout_date.strftime('%Y-%m-%d')
         return None
 
 class RequestingUserSerializer(serializers.ModelSerializer):
@@ -335,6 +449,7 @@ class GroupJoinRequestCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError("Reason should be at least 10 characters if provided.")
         return value.strip()
 
+
 class GroupDashboardCardSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(read_only=True)
     current_members = serializers.IntegerField(read_only=True)
@@ -351,49 +466,85 @@ class GroupDashboardCardSerializer(serializers.ModelSerializer):
             'contribution_amount', 'frequency'
         ]
 
+    def _get_prefetched_contributions(self, obj):
+        """
+        Helper to get contributions from pre-loaded memory.
+        This avoids N+1 queries by accessing the prefetched 'memberships'
+        and their 'contributions'.
+        """
+
+        all_contributions = []
+        for membership in obj.memberships.all():
+            all_contributions.extend(list(membership.contributions.all()))
+        return all_contributions
+
     @extend_schema_field(OpenApiTypes.INT)
     def get_next_payout_days(self, obj):
         return obj.days_until_next_payout
 
-    @extend_schema_field(OpenApiTypes.FLOAT)
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_user_total_contribution(self, obj):
+        """
+        Calculates personal verified contributions using in-memory data.
+        """
         user = self.context['request'].user
-        membership = GroupMembership.objects.filter(user=user, group=obj).first()
-        if not membership:
-            return 0.0
-        total = membership.contributions.aggregate(total=Sum('amount'))['total']
-        return float(total) if total else 0.0
+        if not user.is_authenticated:
+            return Decimal('0.00')
 
-    @extend_schema_field(OpenApiTypes.FLOAT)
+        contribs = self._get_prefetched_contributions(obj)
+
+        total = sum(
+            c.amount for c in contribs
+            if c.membership.user_id == user.id and c.is_verified
+        )
+
+        return Decimal(total).quantize(Decimal("0.01"))
+
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_total_saved(self, obj):
+        """
+        Total verified contributions for the ENTIRE group in the CURRENT cycle using in-memory data.
+        """
         current_cycle = obj.current_cycle_number
-        total = Contribution.objects.filter(
-            membership__group=obj,
-            cycle_number=current_cycle
-        ).aggregate(total=Sum('amount'))['total']
-        return float(total) if total else 0.0
+        contribs = self._get_prefetched_contributions(obj)
+
+        total = sum(
+            c.amount for c in contribs
+            if c.cycle_number == current_cycle and c.is_verified
+        )
+
+        return Decimal(total).quantize(Decimal("0.01"))
 
     @extend_schema_field(OpenApiTypes.FLOAT)
     def get_progress_percentage(self, obj):
+        """
+        Visual progress of the current cycle's funding using in-memory data.
+        """
         current_cycle = obj.current_cycle_number
-        total_contributed = Contribution.objects.filter(
-            membership__group=obj,
-            cycle_number=current_cycle
-        ).aggregate(total=Sum('amount'))['total'] or 0
+        contribs = self._get_prefetched_contributions(obj)
+
+        total_contributed = sum(
+            c.amount for c in contribs
+            if c.cycle_number == current_cycle and c.is_verified
+        )
 
         expected_per_cycle = obj.contribution_amount * obj.expected_members
+
         if expected_per_cycle == 0:
             return 0.0
-        percentage = (total_contributed / expected_per_cycle) * 100
-        return round(percentage, 1)
+
+        percentage = (Decimal(total_contributed) / expected_per_cycle) * Decimal("100.0")
+        return float(percentage.quantize(Decimal("0.1")))
+
 
 
 class DashboardResponseSerializer(serializers.Serializer):
     """
     Serializer defining the complete structure of the /api/accounts/dashboard/ GET response.
-    This resolves the drf-spectacular schema definition issues.
     """
-    total_savings = serializers.FloatField(
+    total_savings = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
         help_text='Total amount saved by the user across all groups.'
     )
     growth_percentage = serializers.FloatField(
@@ -421,11 +572,14 @@ class SavingsGoalCreateSerializer(serializers.ModelSerializer):
         Additional validation: ensure target date is in the future.
         """
         if data['target_date'] < timezone.now().date():
-            raise serializers.ValidationError("Target date must be in the future.")
+            raise serializers.ValidationError({"target_date": "Target date must be in the future."})
+
         if data['target_amount'] <= 0:
-            raise serializers.ValidationError("Target amount must be greater than zero.")
+            raise serializers.ValidationError({"target_amount": "Target amount must be greater than zero."})
+
         if data['regular_contribution'] <= 0:
-            raise serializers.ValidationError("Regular contribution must be greater than zero.")
+             raise serializers.ValidationError({"regular_contribution": "Regular contribution must be greater than zero."})
+
         return data
 
     def create(self, validated_data):
@@ -435,7 +589,7 @@ class SavingsGoalCreateSerializer(serializers.ModelSerializer):
 
 class SavingsGoalSerializer(serializers.ModelSerializer):
     """
-    Base serializer for SavingsGoal with computed fields used in lists and details.
+    Base serializer for SavingsGoal with high-precision Decimal fields.
     """
     current_saved = serializers.SerializerMethodField()
     progress_percentage = serializers.SerializerMethodField()
@@ -451,13 +605,29 @@ class SavingsGoalSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'current_saved', 'progress_percentage', 'days_left']
 
-    @extend_schema_field(OpenApiTypes.FLOAT)
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_current_saved(self, obj):
-        return float(obj.current_saved)
+        """
+        Returns total confirmed savings for this goal as a Decimal.
+        """
+        total = obj.contributions.filter(is_verified=True).aggregate(
+            total=Sum('amount')
+        )['total']
+        return total or Decimal('0.00')
 
     @extend_schema_field(OpenApiTypes.FLOAT)
     def get_progress_percentage(self, obj):
-        return round(obj.progress_percentage, 1)
+        """
+        Returns the percentage toward the goal. Float is used for UI progress bars.
+        """
+        current = self.get_current_saved(obj)
+        target = obj.target_amount
+
+        if target <= 0:
+            return 0.0
+
+        percentage = (current / target) * 100
+        return float(round(percentage, 1))
 
     @extend_schema_field(OpenApiTypes.STR)
     def get_days_left(self, obj):
@@ -484,19 +654,22 @@ class GoalDashboardCardSerializer(SavingsGoalSerializer):
 class GoalsDashboardResponseSerializer(serializers.Serializer):
     """
     Top-level response serializer for the /goals/dashboard/ endpoint.
-    Defines the structure of the overview card + list of goal cards.
     """
-    total_target = serializers.FloatField(
+    total_target = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
         help_text="Sum of target_amount across all user's goals."
     )
-    total_saved = serializers.FloatField(
-        help_text="Sum of current_saved across all user's goals."
+    total_saved = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        help_text="Sum of confirmed current_saved across all user's goals."
     )
     overall_progress = serializers.FloatField(
         help_text="Overall progress percentage (total_saved / total_target × 100)."
     )
     active_goals_count = serializers.IntegerField(
-        help_text="Number of goals that are still active (not completed and not overdue if you prefer, but here includes overdue but incomplete)."
+        help_text="Number of goals that are still active."
     )
     goals = GoalDashboardCardSerializer(
         many=True,
@@ -521,17 +694,28 @@ class SavingsGoalUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Target amount must be greater than zero.")
         if 'regular_contribution' in data and data['regular_contribution'] <= 0:
             raise serializers.ValidationError("Regular contribution must be greater than zero.")
-        # Prevent reducing target below current saved
         if 'target_amount' in data and instance and data['target_amount'] < instance.current_saved:
             raise serializers.ValidationError("Cannot set target below current saved amount.")
         return data
 
 
-class GroupsStatsResponseSerializer(serializers.Serializer):
-    total_groups = serializers.IntegerField(help_text="Number of active groups the user is currently a member of.")
-    total_members = serializers.IntegerField(help_text="Total number of members across all the user's active groups.")
-    group_savings = serializers.FloatField(help_text="Combined total of current savings (sum of verified contributions in the current cycle) across all the user's active groups.")
 
+class GroupsStatsResponseSerializer(serializers.Serializer):
+    """
+    Serializer for the /groups/stats/ endpoint.
+    Ensures group-wide savings totals are handled with high precision.
+    """
+    total_groups = serializers.IntegerField(
+        help_text="Number of active groups the user is currently a member of."
+    )
+    total_members = serializers.IntegerField(
+        help_text="Total number of members across all the user's active groups."
+    )
+    group_savings = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        help_text="Combined total of confirmed savings across all the user's active groups."
+    )
 
 class JoinRequestsStatsSerializer(serializers.Serializer):
     pending = serializers.IntegerField(
