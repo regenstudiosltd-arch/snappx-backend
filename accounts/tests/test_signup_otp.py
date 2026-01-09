@@ -1,6 +1,7 @@
 import io
 import pytest
 from django.urls import reverse
+from django.test import override_settings
 from unittest.mock import patch
 from rest_framework import status
 from accounts.models import User, Profile
@@ -46,9 +47,11 @@ def test_signup_file_upload_failure_handling(api_client):
 
 
 @pytest.mark.django_db
+@override_settings(RATELIMIT_ENABLE=False)
 def test_otp_invalidation_prevents_reuse(api_client, test_user):
     """
     Security: After successful verification, the OTP must be invalidated.
+    Rate limiting is disabled here to allow rapid sequential requests.
     """
     url = reverse('otp-verify')
     data = {"phone_number": test_user.profile.momo_number, "code": "VALID123"}
@@ -60,5 +63,6 @@ def test_otp_invalidation_prevents_reuse(api_client, test_user):
     # Second attempt should fail (invalidated)
     with patch("accounts.views.verify_and_invalidate_otp_sync", return_value=False):
         response = api_client.post(url, data)
+
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert "Invalid or expired OTP" in str(response.data)
