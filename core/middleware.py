@@ -1,5 +1,6 @@
 import uuid
 from threading import local
+from django.http import JsonResponse
 
 _thread_locals = local()
 
@@ -18,4 +19,24 @@ class RequestIDMiddleware:
         response = self.get_response(request)
 
         response['X-Request-ID'] = request_id
+        return response
+
+class IdempotencyMiddleware:
+    """
+    Middleware to handle X-Idempotency-Key headers for state-changing requests.
+    """
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.method in ['POST', 'PUT', 'PATCH']:
+            # Extract the key from headers
+            idempotency_key = request.headers.get('X-Idempotency-Key')
+
+            # Attach it to the request object so views/decorators can find it
+            request.idempotency_key = idempotency_key
+
+            _thread_locals.idempotency_key = idempotency_key
+
+        response = self.get_response(request)
         return response
