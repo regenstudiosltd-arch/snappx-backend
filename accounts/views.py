@@ -276,11 +276,25 @@ class VerifyOTPView(APIView):
         phone = serializer.validated_data['phone_number']
         code = serializer.validated_data['code']
 
+        try:
+            parsed_num = phonenumbers.parse(phone, "GH")
+            if phonenumbers.is_valid_number(parsed_num):
+                normalized_phone = phonenumbers.format_number(parsed_num, phonenumbers.PhoneNumberFormat.E164)
+            else:
+                normalized_phone = phone.strip()
+        except Exception:
+            normalized_phone = phone.strip()
+
         if verify_and_invalidate_otp_sync(phone, code):
             try:
-                profile = Profile.objects.get(momo_number=phone)
+                salt = getattr(settings, "HASH_SALT", settings.SECRET_KEY)
+                hash_input = f"{normalized_phone}{salt}".encode('utf-8')
+                phone_hash = hashlib.sha256(hash_input).hexdigest()
+
+                profile = Profile.objects.get(momo_number_hash=phone_hash)
                 profile.user.is_verified = True
                 profile.user.save(update_fields=['is_verified'])
+
                 return Response({
                     "success": True,
                     "message": "Welcome to SnappX! Your account is verified."
@@ -373,7 +387,6 @@ class CreateSavingsGroupView(APIView):
 )
 class MyJoinedGroupsListView(generics.ListAPIView):
     """
-    Replaces MyGroupsListView.
     Shows groups the user has joined (as member or admin).
     """
     serializer_class = SavingsGroupSerializer
@@ -409,7 +422,7 @@ class MyJoinedGroupsListView(generics.ListAPIView):
 )
 class GroupDetailView(generics.RetrieveAPIView):
     """
-    Updated: Now allows any group member to view details.
+    Allows any group member to view details.
     """
     serializer_class = SavingsGroupSerializer
     permission_classes = [IsAuthenticated]
