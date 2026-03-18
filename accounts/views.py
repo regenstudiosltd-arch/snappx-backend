@@ -1,3 +1,5 @@
+# accounts/views.py
+
 import uuid
 import hashlib
 import logging
@@ -12,7 +14,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import serializers as rest_serializers
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
-from rest_framework.parsers import MultiPartParser
+from rest_framework.parsers import MultiPartParser, JSONParser
 from django.db import transaction, IntegrityError
 from django_ratelimit.decorators import ratelimit
 from rest_framework.filters import SearchFilter
@@ -20,7 +22,7 @@ from django.contrib.auth import get_user_model
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import generics, status, permissions
-from .permissions import IsGroupAdmin
+from .permissions import IsGroupAdmin, IsGoalOwner
 from django.utils import timezone
 from django.db.models import Sum, F
 from dateutil.relativedelta import relativedelta
@@ -38,6 +40,8 @@ from .serializers import (
     SavingsGoalSerializer, SavingsGoalUpdateSerializer, GroupsStatsResponseSerializer,
     JoinRequestsStatsSerializer, GroupJoinRequestCreateSerializer
 )
+
+from rest_framework import status
 
 logger = logging.getLogger('accounts.finance')
 User = get_user_model()
@@ -347,28 +351,22 @@ class CreateSavingsGroupView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # Create the Group
             group = serializer.save(admin=request.user)
 
-            # Add Admin as the first member
             from .models import GroupMembership, PayoutOrder
-            membership = GroupMembership.objects.create(
-                user=request.user,
-                group=group
-            )
+            membership = GroupMembership.objects.get(user=request.user, group=group)
 
-            # Initialize Payout Order for the Admin (as first member)
-            PayoutOrder.objects.create(
+            PayoutOrder.objects.get_or_create(
                 group=group,
                 membership=membership,
-                position=1
+                defaults={'position': 1}
             )
 
-            logger.info(f"Group {group.group_name} created by {request.user.email}. Wallet initialized via signal.")
+            logger.info(f"Group {group.group_name} created by {request.user.email}.")
 
             return Response({
                 "success": True,
-                "message": "Savings group created! You have been added as the first member.",
+                "message": "Savings group created!",
                 "group_id": group.id
             }, status=status.HTTP_201_CREATED)
 
@@ -1076,49 +1074,124 @@ class ContributeToGoalView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 @extend_schema(
-    methods=['GET'],
-    responses={200: SavingsGoalSerializer},
-    description="Retrieve details of a specific savings goal owned by the user.",
-    tags=['Savings Goals']
+    tags=['Savings Goals'],
+    summary="Manage a single savings goal (GET / PATCH / DELETE)",
+    description="Authenticated owner can retrieve, partially update, or delete their goal (cascades to contributions).",
 )
-@extend_schema(
-    methods=['PATCH'],
-    request=SavingsGoalUpdateSerializer,
-    responses={
-        200: SavingsGoalSerializer,
-        400: {'description': 'Validation error'}
-    },
-    description="Partially update a savings goal owned by the user.",
-    tags=['Savings Goals']
-)
-@extend_schema(
-    methods=['DELETE'],
-    responses={
-        204: {'description': 'Goal deleted successfully.'},
-        404: {'description': 'Goal not found or not owned.'}
-    },
-    description="Delete a savings goal owned by the user (and its contributions).",
-    tags=['Savings Goals']
-)
+@method_decorator(never_cache, name='dispatch')
 class GoalDetailView(RetrieveUpdateDestroyAPIView):
+    """Implementation – atomic, observable, idempotent, heavily guarded."""
+
     serializer_class = SavingsGoalSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsGoalOwner]
     lookup_field = 'id'
+    parser_classes = [JSONParser]
 
     def get_queryset(self):
+        # Double protection (queryset + permission)
         return SavingsGoal.objects.filter(user=self.request.user)
 
     def get_serializer_class(self):
-        if self.request.method == 'PATCH':
+        if self.request.method in ('PATCH', 'PUT'):
             return SavingsGoalUpdateSerializer
         return super().get_serializer_class()
 
+    @extend_schema(
+        responses={200: SavingsGoalSerializer},
+        description="Retrieve full goal details (including computed fields).",
+    )
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema(
+        request=SavingsGoalUpdateSerializer,
+        responses={
+            200: SavingsGoalSerializer,
+            400: OpenApiExample("Validation failed", value={"target_date": ["must be in future"]}),
+            409: {"description": "Idempotency conflict"}
+        },
+        examples=[
+            OpenApiExample(
+                "Update target & frequency",
+                value={"target_amount": 15000, "frequency": "monthly"},
+                request_only=True,
+            )
+        ],
+    )
+    @method_decorator(ratelimit(key='user', rate='20/m', block=True))
+    @idempotent_request
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        goal = self.get_object()
+        goal = SavingsGoal.objects.select_for_update().get(pk=goal.pk)
+
+        logger.info({
+            "event": "savings_goal_update_started",
+            "user_id": request.user.id,
+            "goal_id": goal.id,
+            "request_id": getattr(request, 'request_id', None),
+            "idempotency_key": request.headers.get('X-Idempotency-Key')
+        })
+
+        response = super().update(request, *args, **kwargs)
+
+        logger.info({
+            "event": "savings_goal_updated",
+            "user_id": request.user.id,
+            "goal_id": goal.id,
+            "changes": request.data,
+            "new_target": str(goal.target_amount),
+            "request_id": getattr(request, 'request_id', None)
+        })
+
+        return response
+
+    @extend_schema(
+        responses={
+            204: OpenApiExample("Success", value={"message": "Goal and all contributions permanently deleted"}),
+            404: {"description": "Goal not found or not owned"},
+        },
+        description="Hard delete + cascade. Irreversible. Audit logged.",
+    )
+    @method_decorator(ratelimit(key='user', rate='5/h', block=True))
+    @idempotent_request
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        goal = self.get_object()
+        goal = SavingsGoal.objects.select_for_update().get(pk=goal.pk)
+
+        contrib_count = goal.contributions.count()
+        goal_name = goal.name
+        goal_id = goal.id
+
+        logger.info({
+            "event": "savings_goal_delete_requested",
+            "user_id": request.user.id,
+            "goal_id": goal_id,
+            "contributions_deleted": contrib_count,
+            "request_id": getattr(request, 'request_id', None)
+        })
+
+        with transaction.atomic():
+            GoalContribution.objects.filter(goal=goal).delete()
+            goal.delete()
+
+        logger.info({
+            "event": "savings_goal_deleted",
+            "user_id": request.user.id,
+            "goal_id": goal_id,
+            "goal_name": goal_name,
+            "contributions_removed": contrib_count,
+            "request_id": getattr(request, 'request_id', None)
+        })
+
+        return Response({
+            "success": True,
+            "message": f"Goal '{goal_name}' and {contrib_count} contribution(s) deleted permanently."
+        }, status=status.HTTP_204_NO_CONTENT)
+
     def perform_update(self, serializer):
         serializer.save()
-
-    def perform_destroy(self, instance):
-        instance.delete()
-
 
 class GroupsStatsView(APIView):
     permission_classes = [IsAuthenticated]
