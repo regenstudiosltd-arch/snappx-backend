@@ -1,5 +1,6 @@
 import os
 import uuid
+import random
 from decimal import Decimal
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.auth.models import AbstractUser
@@ -272,7 +273,17 @@ class SavingsGroup(models.Model):
     )
     approved_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    public_id = models.CharField (max_length=20, unique=True, editable=False, default=None, null=True)
     is_public = models.BooleanField(default=False)
+
+    def save(self, *args, **kwargs):
+        if not self.public_id:
+            while True:
+                candidate = str(random.randint(10**18, 10**19 - 1))  # 19-digit number
+                if not SavingsGroup.objects.filter(public_id=candidate).exists():
+                    self.public_id = candidate
+                    break
+        super().save(*args, **kwargs)
 
     class Meta:
         ordering = ['-created_at']
