@@ -15,6 +15,7 @@ from drf_spectacular.utils import extend_schema_field, OpenApiTypes
 from decimal import Decimal
 from django.utils import timezone
 from django.db import transaction
+from drf_spectacular.utils import inline_serializer
 
 User = get_user_model()
 
@@ -313,9 +314,8 @@ class SavingsGroupCreateSerializer(serializers.ModelSerializer):
                 live_photo=kyc_data.get('live_photo')
             )
 
-        # Create the Savings Group
+        # # Create the Savings Group
         group = SavingsGroup.objects.create(
-            admin=user,
             status='pending',
             **validated_data
         )
@@ -347,7 +347,7 @@ class SavingsGroupSerializer(serializers.ModelSerializer):
             'payout_timeline_days', 'expected_members', 'current_members',
             'description', 'status', 'status_display', 'created_at',
             'admin_name', 'admin_phone', 'admin_photo',
-            'total_savings', 'total_group_savings', 'next_due'
+            'total_savings', 'total_group_savings', 'next_due', 'public_id'
         ]
         read_only_fields = ['status', 'current_members', 'created_at']
 
@@ -392,10 +392,16 @@ class RequestingUserSerializer(serializers.ModelSerializer):
     """Minimal serializer to show details of the user who submitted the request."""
     full_name = serializers.CharField(source='profile.full_name', read_only=True)
     momo_number = serializers.CharField(source='profile.momo_number', read_only=True)
+    # NEW: profile picture (Cloudinary URL) – exactly the same field used everywhere else
+    profile_picture = serializers.URLField(
+        source='profile.profile_picture',
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'full_name', 'momo_number']
+        fields = ['id', 'email', 'full_name', 'momo_number', 'profile_picture']
 
 class GroupJoinRequestSerializer(serializers.ModelSerializer):
     """Serializer for admin to view pending join requests."""
@@ -678,27 +684,62 @@ class GoalsDashboardResponseSerializer(serializers.Serializer):
 
 
 class SavingsGoalUpdateSerializer(serializers.ModelSerializer):
+    """
+    Serializer for PATCH (partial) updates to an existing SavingsGoal.
+    Enhanced with precise error messaging and future-proof validation
+    """
     class Meta:
         model = SavingsGoal
         fields = [
-            'name', 'target_amount', 'regular_contribution',
-            'target_date', 'frequency'
+            'name',
+            'target_amount',
+            'regular_contribution',
+            'target_date',
+            'frequency'
         ]
         partial = True
 
     def validate(self, data):
+        """
+        All business rule validations in one place.
+        Uses the model's @property current_saved for accuracy.
+        """
         instance = self.instance
+
+        # Future target date
         if 'target_date' in data and data['target_date'] < timezone.now().date():
-            raise serializers.ValidationError("Target date must be in the future.")
+            raise serializers.ValidationError({
+                "target_date": "Target date must be in the future."
+            })
+
+        # Positive amounts
         if 'target_amount' in data and data['target_amount'] <= 0:
-            raise serializers.ValidationError("Target amount must be greater than zero.")
+            raise serializers.ValidationError({
+                "target_amount": "Target amount must be greater than zero."
+            })
+
         if 'regular_contribution' in data and data['regular_contribution'] <= 0:
-            raise serializers.ValidationError("Regular contribution must be greater than zero.")
+            raise serializers.ValidationError({
+                "regular_contribution": "Regular contribution must be greater than zero."
+            })
+
+        # Cannot reduce target below already saved amount
         if 'target_amount' in data and instance and data['target_amount'] < instance.current_saved:
-            raise serializers.ValidationError("Cannot set target below current saved amount.")
+            raise serializers.ValidationError({
+                "target_amount": (
+                    f"Cannot reduce target below already saved amount. "
+                    f"Current saved: ₵{instance.current_saved:,.2f} | "
+                    f"You tried to set: ₵{data['target_amount']:,.2f}"
+                )
+            })
+
+        # frequency must be valid
+        if 'frequency' in data and data['frequency'] not in dict(SavingsGoal.FREQUENCY_CHOICES):
+            raise serializers.ValidationError({
+                "frequency": "Invalid frequency. Choose from daily, weekly, or monthly."
+            })
+
         return data
-
-
 
 class GroupsStatsResponseSerializer(serializers.Serializer):
     """
@@ -726,4 +767,72 @@ class JoinRequestsStatsSerializer(serializers.Serializer):
     )
     declined = serializers.IntegerField(
         help_text="Number of declined (rejected) join requests across all groups administered by the user."
+    )
+
+
+class AnalyticsStatsSerializer(serializers.Serializer):
+    total_savings = serializers.DecimalField(max_digits=12, decimal_places=2)
+    monthly_growth = serializers.DecimalField(max_digits=12, decimal_places=2)
+    monthly_growth_percentage = serializers.FloatField()
+    active_groups = serializers.IntegerField()
+    goals_progress = serializers.FloatField()
+
+class SavingsOverTimeItem(serializers.Serializer):
+    month = serializers.CharField()
+    amount = serializers.FloatField()
+    contributions = serializers.FloatField()
+
+class SavingsDistributionItem(serializers.Serializer):
+    name = serializers.CharField()
+    value = serializers.FloatField()
+
+class GroupPerformanceItem(serializers.Serializer):
+    name = serializers.CharField()
+    savings = serializers.FloatField()
+    members = serializers.IntegerField()
+
+class AnalyticsResponseSerializer(serializers.Serializer):
+    """
+    Top-level response serializer for the /accounts/analytics/ endpoint.
+    Used both for runtime validation and Swagger documentation.
+    """
+    stats = AnalyticsStatsSerializer()
+    savings_over_time = SavingsOverTimeItem(many=True)
+    savings_distribution = SavingsDistributionItem(many=True)
+    group_performance = GroupPerformanceItem(many=True)
+
+    key_insights = serializers.ListField(
+        child=inline_serializer(
+            name='KeyInsight',
+            fields={
+                'title': serializers.CharField(),
+                'description': serializers.CharField(),
+            }
+        ),
+        help_text="List of 3 dynamic key insights based on user activity"
+    )
+
+    recommendations = serializers.ListField(
+        child=inline_serializer(
+            name='Recommendation',
+            fields={
+                'title': serializers.CharField(),
+                'description': serializers.CharField(),
+            }
+        ),
+        help_text="List of 3 personalized recommendations"
+    )
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """Secure password change for authenticated users."""
+    current_password = serializers.CharField(
+        write_only=True,
+        required=True,
+        help_text="Your current password (required for security)"
+    )
+    new_password = serializers.CharField(
+        write_only=True,
+        min_length=8,
+        required=True,
+        help_text="New password (minimum 8 characters)"
     )
