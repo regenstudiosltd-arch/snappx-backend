@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from decouple import config
 from pathlib import Path
 from celery.schedules import crontab
+from corsheaders.defaults import default_headers
 
 # Load .env file
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -49,7 +50,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'core.middleware.RequestIDMiddleware',
+    'core.middleware.IdempotencyMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -147,9 +150,13 @@ AUTH_USER_MODEL = 'accounts.User'
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
 ]
+
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    "x-idempotency-key",
+    "x-request-id",
+]
+
 CORS_ALLOW_CREDENTIALS = True
 
 # REST Framework + JWT
