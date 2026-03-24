@@ -3,6 +3,7 @@ from django.utils.html import format_html
 from django.utils import timezone
 from django.contrib import admin
 from django.db import transaction
+from django.utils.safestring import mark_safe
 
 @admin.register(GroupAdminKYC)
 class GroupAdminKYCAdmin(admin.ModelAdmin):
@@ -65,7 +66,9 @@ class GroupAdminKYCAdmin(admin.ModelAdmin):
         )
 
     def verification_status(self, obj):
-        return format_html('<b style="color: green;">✅ Verified</b>') if obj.is_manually_verified else format_html('<b style="color: red;">❌ Pending</b>')
+        if obj.is_manually_verified:
+            return mark_safe('<b style="color: green;">✅ Verified</b>')
+        return mark_safe('<b style="color: red;">❌ Pending</b>')
 
 @admin.register(SavingsGroup)
 class SavingsGroupAdmin(admin.ModelAdmin):
