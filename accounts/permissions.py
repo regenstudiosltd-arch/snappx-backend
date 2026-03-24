@@ -1,5 +1,5 @@
 from rest_framework import permissions
-from .models import SavingsGroup, GroupJoinRequest
+from .models import SavingsGoal, SavingsGroup, GroupJoinRequest
 
 class IsGroupAdmin(permissions.BasePermission):
     """
@@ -20,4 +20,12 @@ class IsGroupAdmin(permissions.BasePermission):
         if isinstance(obj, GroupJoinRequest):
             return obj.group.admin == request.user
 
+        return False
+
+class IsGoalOwner(permissions.BasePermission):
+    message = "You can only manage goals you own."
+
+    def has_object_permission(self, request, view, obj):
+        if isinstance(obj, SavingsGoal):
+            return obj.user == request.user
         return False
