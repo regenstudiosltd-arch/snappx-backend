@@ -1,5 +1,3 @@
-# accounts/views.py
-
 import uuid
 import hashlib
 import logging
@@ -24,16 +22,16 @@ from rest_framework.views import APIView
 from rest_framework import generics, status, permissions
 from .permissions import IsGroupAdmin, IsGoalOwner
 from django.utils import timezone
-from django.db.models import Sum, F
+from django.db.models import Sum, F, Q
 from dateutil.relativedelta import relativedelta
 import phonenumbers
 from decimal import Decimal
 from rest_framework.generics import RetrieveUpdateDestroyAPIView
-from rest_framework import serializers
+from rest_framework import serializers, status
 from .utils import idempotent_request
 from .services import LedgerService
 from .serializers import (
-    GoalDashboardCardSerializer, SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
+    AnalyticsResponseSerializer, ChangePasswordSerializer, GoalDashboardCardSerializer, SavingsGroupCreateSerializer, SavingsGroupSerializer, SendOTPSerializer, VerifyOTPSerializer,
     CustomTokenObtainPairSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, ProfileSerializer,
     FullSignupSerializer, GroupJoinRequestSerializer, GroupJoinActionSerializer, GroupDashboardCardSerializer,
     DashboardResponseSerializer, SavingsGoalCreateSerializer, GoalsDashboardResponseSerializer,
@@ -41,7 +39,7 @@ from .serializers import (
     JoinRequestsStatsSerializer, GroupJoinRequestCreateSerializer
 )
 
-from rest_framework import status
+from django.db.models.functions import TruncMonth
 
 logger = logging.getLogger('accounts.finance')
 User = get_user_model()
@@ -245,6 +243,56 @@ class ResetPasswordView(APIView):
         except Profile.DoesNotExist:
             return Response({"error": "Invalid request"}, status=status.HTTP_400_BAD_REQUEST)
 
+
+@extend_schema(
+    request=ChangePasswordSerializer,
+    responses={
+        200: inline_serializer(
+            name="PasswordChangeSuccess",
+            fields={"message": serializers.CharField()}
+        ),
+        400: {"description": "Current password incorrect or validation error"},
+    },
+    description="Change password while logged in. Requires current password for security.",
+    tags=["User Management"]
+)
+class ChangePasswordView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @method_decorator([
+        never_cache,
+        ratelimit(key='user', rate='3/h', method='POST', block=True)
+    ], name='dispatch')
+    @idempotent_request
+    @transaction.atomic
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        current_password = serializer.validated_data['current_password']
+        new_password = serializer.validated_data['new_password']
+
+        if not request.user.check_password(current_password):
+            return Response(
+                {"error": "Current password is incorrect"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        request.user.set_password(new_password)
+        request.user.save(update_fields=['password'])
+
+        logger.info({
+            "event": "password_changed",
+            "user_id": request.user.id,
+            "request_id": getattr(request, 'request_id', None)
+        })
+
+        return Response({
+            "message": "Password updated successfully. Please log in again with the new password."
+        }, status=status.HTTP_200_OK)
+
+
 class SendOTPView(APIView):
     permission_classes = [AllowAny]
     serializer_class = SendOTPSerializer
@@ -397,13 +445,14 @@ class MyJoinedGroupsListView(generics.ListAPIView):
             memberships__user=user
         ).select_related('admin__profile').distinct()
 
+
 @extend_schema(
     parameters=[
         OpenApiParameter(
-            name='id',
-            type=int,
+            name='public_id',
+            type=str,
             location=OpenApiParameter.PATH,
-            description='The ID of the savings group.',
+            description='The public_id of the savings group (or legacy numeric id for backward compatibility).',
             required=True
         ),
     ],
@@ -420,16 +469,40 @@ class MyJoinedGroupsListView(generics.ListAPIView):
 )
 class GroupDetailView(generics.RetrieveAPIView):
     """
-    Allows any group member to view details.
+    Supports BOTH:
+    - New groups: long random public_id (X/Twitter style – unguessable)
+    - Legacy groups (public_id is still NULL): falls back to numeric id
     """
     serializer_class = SavingsGroupSerializer
     permission_classes = [IsAuthenticated]
-    lookup_field = 'id'
+    lookup_field = 'public_id'
 
     def get_queryset(self):
         user = self.request.user
-        # Only return the group if the user is a member
-        return SavingsGroup.objects.filter(memberships__user=user).select_related('admin__profile')
+        return SavingsGroup.objects.filter(
+            memberships__user=user
+        ).select_related('admin__profile')
+
+    def get_object(self):
+        queryset = self.get_queryset()
+        lookup_value = self.kwargs['public_id']
+
+        # 1. Preferred: new public_id (long random string)
+        obj = queryset.filter(public_id=lookup_value).first()
+        if obj is not None:
+            self.check_object_permissions(self.request, obj)
+            return obj
+
+        # 2. Legacy fallback: numeric ID (for groups created before public_id existed)
+        if str(lookup_value).isdigit():
+            obj = queryset.filter(id=int(lookup_value)).first()
+            if obj is not None:
+                self.check_object_permissions(self.request, obj)
+                return obj
+
+        # Same 404 message you already see – no behaviour change
+        from rest_framework.exceptions import NotFound
+        raise NotFound({"detail": "No SavingsGroup matches the given query."})
 
 @extend_schema(
     description="Lists all Active savings groups across the platform, allowing filtering and searching.",
@@ -590,16 +663,20 @@ class GroupRequestsListView(generics.ListAPIView):
 
     def get_queryset(self):
         group_id = self.kwargs.get('group_id')
-
         # Check if the requesting user is the admin of the group
         try:
             group = SavingsGroup.objects.get(id=group_id, admin=self.request.user)
         except SavingsGroup.DoesNotExist:
             raise rest_serializers.ValidationError({"error": "Group not found or you are not the admin."})
 
+        # NEW: Support all statuses via query param (default = pending for backward compatibility)
+        status_filter = self.request.query_params.get('status', 'pending')
+        if status_filter not in ['pending', 'approved', 'rejected']:
+            status_filter = 'pending'
+
         return GroupJoinRequest.objects.filter(
             group=group,
-            status='pending'
+            status=status_filter
         ).select_related('user__profile', 'group')
 
 
@@ -727,10 +804,8 @@ class GroupRequestActionView(APIView):
 
         return Response({"message": message}, status=status.HTTP_200_OK)
 
-
 class DashboardView(APIView):
     permission_classes = [IsAuthenticated]
-
     @extend_schema(
         description="Retrieves the authenticated user's personalized dashboard.",
         tags=['User Dashboard'],
@@ -742,13 +817,20 @@ class DashboardView(APIView):
     def get(self, request):
         user = request.user
 
-        total_savings = LedgerEntry.objects.filter(
-        wallet__user=user,
-        transaction_type__in=['contribution', 'goal_contribution'],
-        direction='credit'
-    ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        total_savings = (
+            # All verified group contributions
+            Contribution.objects.filter(
+                membership__user=user,
+                is_verified=True
+            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        ) + (
+            # All verified goal contributions
+            GoalContribution.objects.filter(
+                goal__user=user,
+                is_verified=True
+            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        )
 
-        # Previous Period Savings
         one_month_ago = timezone.now() - relativedelta(months=1)
         previous_period_savings = Contribution.objects.filter(
             membership__user=user,
@@ -756,12 +838,11 @@ class DashboardView(APIView):
             paid_at__lt=one_month_ago
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        # Growth Percentage Calculation
+        # Growth Percentage
         if previous_period_savings > 0:
             growth_percentage = ((total_savings - previous_period_savings) / previous_period_savings) * 100
         else:
             growth_percentage = 100.0 if total_savings > 0 else 0.0
-
 
         active_memberships = GroupMembership.objects.filter(
             user=user,
@@ -769,14 +850,12 @@ class DashboardView(APIView):
         ).select_related('group').prefetch_related(
             'group__memberships__contributions'
         )
-
         groups = [m.group for m in active_memberships]
-
         groups_serializer = GroupDashboardCardSerializer(
              groups, many=True, context={'request': request}
         )
-
         growth_val = round(float(growth_percentage), 1)
+
         return Response({
             "total_savings": total_savings,
             "growth_percentage": growth_val,
@@ -1242,6 +1321,230 @@ class GroupsStatsView(APIView):
             'group_savings': group_savings
         })
 
+
+@extend_schema(
+    tags=['Analytics'],
+    parameters=[
+        OpenApiParameter(
+            name='period',
+            type=str,
+            location=OpenApiParameter.QUERY,
+            description='Time range for charts and growth',
+            enum=['1month', '3months', '6months', '1year', 'all'],
+            default='6months'
+        )
+    ],
+    responses={200: AnalyticsResponseSerializer},
+    description="Full analytics data for the dashboard. Includes time-range aware charts, growth metrics, dynamic insights & recommendations."
+)
+class AnalyticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def safe_sum(self, queryset):
+        """Safely convert aggregate['total'] (which can be None) to Decimal(0)."""
+        result = queryset.aggregate(total=Sum('amount'))['total']
+        return result or Decimal('0.00')
+
+    def get(self, request):
+        period = request.query_params.get('period', '6months')
+        months_map = {'1month': 1, '3months': 3, '6months': 6, '1year': 12, 'all': None}
+        months_back = months_map.get(period, 6)
+
+        user = request.user
+
+        # === Wallet (only for distribution & recommendations) ===
+        try:
+            wallet = Wallet.objects.get(user=user)
+            wallet_balance = wallet.current_balance
+        except Wallet.DoesNotExist:
+            wallet_balance = Decimal('0.00')
+
+        # === Totals – matches your existing DashboardView (NO negative wallet) ===
+        group_total = self.safe_sum(
+            Contribution.objects.filter(membership__user=user, is_verified=True)
+        )
+        goal_total = self.safe_sum(
+            GoalContribution.objects.filter(goal__user=user, is_verified=True)
+        )
+        total_savings = group_total + goal_total   # ← Correct total (only verified contributions)
+
+        # === Growth Calculations (safe) ===
+        one_month_ago = timezone.now() - relativedelta(months=1)
+        two_months_ago = one_month_ago - relativedelta(months=1)
+
+        previous_total = (
+            self.safe_sum(Contribution.objects.filter(membership__user=user, is_verified=True, paid_at__lt=one_month_ago)) +
+            self.safe_sum(GoalContribution.objects.filter(goal__user=user, is_verified=True, paid_at__lt=one_month_ago))
+        )
+
+        last_month_add = (
+            self.safe_sum(Contribution.objects.filter(membership__user=user, is_verified=True, paid_at__gte=one_month_ago)) +
+            self.safe_sum(GoalContribution.objects.filter(goal__user=user, is_verified=True, paid_at__gte=one_month_ago))
+        )
+
+        prev_month_add = (
+            self.safe_sum(Contribution.objects.filter(membership__user=user, is_verified=True, paid_at__gte=two_months_ago, paid_at__lt=one_month_ago)) +
+            self.safe_sum(GoalContribution.objects.filter(goal__user=user, is_verified=True, paid_at__gte=two_months_ago, paid_at__lt=one_month_ago))
+        )
+
+        monthly_growth_pct = ((last_month_add - prev_month_add) / prev_month_add * 100) if prev_month_add > 0 else 100.0
+
+        # Active groups & goals progress
+        active_groups = GroupMembership.objects.filter(user=user, group__status='active').count()
+
+        total_target = SavingsGoal.objects.filter(user=user).aggregate(
+            total=Sum('target_amount')
+        )['total'] or Decimal('0.00')
+        goals_progress = float((goal_total / total_target * 100)) if total_target > 0 else 0.0
+
+        # === Savings Over Time (continuous months – no gaps) ===
+        contrib_qs = Contribution.objects.filter(
+            membership__user=user, is_verified=True
+        ).annotate(month=TruncMonth('paid_at')).values('month').annotate(
+            total=Sum('amount')
+        ).order_by('month')
+
+        goal_qs = GoalContribution.objects.filter(
+            goal__user=user, is_verified=True
+        ).annotate(month=TruncMonth('paid_at')).values('month').annotate(
+            total=Sum('amount')
+        ).order_by('month')
+
+        monthly_dict = {}
+        for item in list(contrib_qs) + list(goal_qs):
+            m = item['month']
+            monthly_dict[m] = monthly_dict.get(m, Decimal('0.00')) + item['total']
+
+        if monthly_dict:
+            all_months = sorted(monthly_dict.keys())
+            current = all_months[0].replace(day=1)
+            last = all_months[-1].replace(day=1)
+            full_months = []
+            while current <= last:
+                full_months.append(current)
+                current += relativedelta(months=1)
+        else:
+            full_months = []
+
+        savings_over_time = []
+        cumulative = Decimal('0.00')
+        for m_start in full_months:
+            contrib_this = monthly_dict.get(m_start, Decimal('0.00'))
+            cumulative += contrib_this
+            savings_over_time.append({
+                'month': m_start.strftime('%b'),
+                'amount': float(cumulative),
+                'contributions': float(contrib_this)
+            })
+
+        if months_back is not None:
+            savings_over_time = savings_over_time[-months_back:]
+
+        # === Savings Distribution (clamped ≥ 0 so pie chart never breaks) ===
+        savings_distribution = [
+            {'name': 'Emergency Fund', 'value': float(max(Decimal('0.00'), wallet_balance))},
+            {'name': 'Goals', 'value': float(goal_total)},
+            {'name': 'Group Savings', 'value': float(group_total)},
+        ]
+
+        # === Group Performance ===
+        groups_qs = SavingsGroup.objects.filter(
+            memberships__user=user, status='active'
+        ).distinct()
+        group_performance = []
+        for g in groups_qs:
+            group_savings = self.safe_sum(
+                Contribution.objects.filter(membership__group=g, is_verified=True)
+            )
+            group_performance.append({
+                'name': g.group_name,
+                'savings': float(group_savings),
+                'members': g.current_members
+            })
+
+        # === Dynamic Key Insights & Recommendations (real data driven) ===
+        # Top performing group
+        sorted_groups = sorted(group_performance, key=lambda x: x.get('savings', 0), reverse=True)
+        top_group = sorted_groups[0] if sorted_groups else {'name': 'No groups yet', 'savings': 0}
+
+        avg_monthly_contribution = float(last_month_add)
+
+        key_insights = [
+            {
+                "title": "Strong Savings Momentum",
+                "description": f"You've increased your savings by {round(monthly_growth_pct, 1)}% in the last period"
+            },
+            {
+                "title": "Consistent Contributions",
+                "description": f"Your average monthly contribution is GHS {avg_monthly_contribution:,.0f}"
+            },
+            {
+                "title": "Top Performing Group",
+                "description": f'"{top_group["name"]}" has the highest total savings of GHS {top_group["savings"]:,.0f}'
+            }
+        ]
+
+        # Rule-based recommendations (financial best practices)
+        recommendations = []
+        if goals_progress < 70:
+            recommendations.append({
+                "title": "Focus on Goals",
+                "description": f"You're at {round(goals_progress, 1)}% progress. Increase your regular contribution to hit targets faster."
+            })
+        else:
+            recommendations.append({
+                "title": "You're Crushing Your Goals",
+                "description": "Excellent progress! Consider raising your target_amount for new challenges."
+            })
+
+        if active_groups < 3:
+            recommendations.append({
+                "title": "Diversify Savings",
+                "description": f"Join 1-2 more groups to spread risk and accelerate growth (you currently have {active_groups})."
+            })
+        else:
+            recommendations.append({
+                "title": "Well Diversified",
+                "description": f"You have {active_groups} active groups – great portfolio balance!"
+            })
+
+        if wallet_balance < total_savings * Decimal('0.15'):
+            recommendations.append({
+                "title": "Boost Emergency Fund",
+                "description": "Your cash reserve is low. Aim to keep at least 15% of total savings in your wallet."
+            })
+        else:
+            recommendations.append({
+                "title": "Solid Emergency Fund",
+                "description": "Your wallet is healthy. Keep maintaining it."
+            })
+
+        # Ensure exactly 3 recommendations
+        while len(recommendations) < 3:
+            recommendations.append({
+                "title": "Set New Goals",
+                "description": "You're on track! Consider creating a new savings goal."
+            })
+        recommendations = recommendations[:3]
+
+        # Final response
+        data = {
+            'stats': {
+                'total_savings': total_savings,
+                'monthly_growth': last_month_add,
+                'monthly_growth_percentage': round(float(monthly_growth_pct), 1),
+                'active_groups': active_groups,
+                'goals_progress': round(goals_progress, 1),
+            },
+            'savings_over_time': savings_over_time,
+            'savings_distribution': savings_distribution,
+            'group_performance': group_performance,
+            'key_insights': key_insights,
+            'recommendations': recommendations,
+        }
+
+        return Response(data)
+
 @extend_schema(
     description=(
         "Provides aggregated statistics for the 'Join Requests' admin dashboard cards: "
@@ -1288,4 +1591,69 @@ class JoinRequestsStatsView(APIView):
             'pending': stats['pending'] or 0,
             'accepted': stats['accepted'] or 0,
             'declined': stats['declined'] or 0,
+        })
+
+
+@extend_schema(
+    request=inline_serializer(
+        name="ProfileUpdateRequest",
+        fields={
+            "email": serializers.EmailField(required=False),
+            "full_name": serializers.CharField(required=False),
+            "user_type": serializers.ChoiceField(choices=["student", "worker"], required=False),
+            "ghana_post_address": serializers.CharField(required=False),
+            "momo_provider": serializers.ChoiceField(choices=["mtn", "telecel", "airteltigo"], required=False),
+            "momo_number": serializers.CharField(required=False),
+            "momo_name": serializers.CharField(required=False),
+        }
+    ),
+    responses={200: MeViewResponseSerializer},
+    description="Update profile and MoMo payout details (partial update). Email is handled on the User model.",
+    tags=['User Management']
+)
+class ProfileUpdateView(APIView):
+    """L3-grade profile + payout update endpoint."""
+    permission_classes = [IsAuthenticated]
+
+    @idempotent_request
+    @transaction.atomic
+    def patch(self, request):
+        user = request.user
+        profile = user.profile
+        data = request.data
+
+        # Email update (with uniqueness check)
+        if 'email' in data and data['email'] != user.email:
+            new_email = data['email'].lower().strip()
+            if User.objects.filter(email=new_email).exclude(pk=user.pk).exists():
+                return Response({"error": "This email is already registered"}, status=status.HTTP_400_BAD_REQUEST)
+            user.email = new_email
+            user.save(update_fields=['email'])
+            logger.info({"event": "email_changed", "user_id": user.id, "new_email": new_email})
+
+        # Profile fields
+        profile_fields = {'full_name', 'user_type', 'ghana_post_address', 'momo_provider', 'momo_number', 'momo_name'}
+        profile_data = {k: v for k, v in data.items() if k in profile_fields}
+
+        serializer = ProfileSerializer(profile, data=profile_data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer.save()
+
+        logger.info({
+            "event": "profile_updated",
+            "user_id": user.id,
+            "updated_fields": list(profile_data.keys()),
+            "request_id": getattr(request, 'request_id', None)
+        })
+
+        # Return same shape as /me/
+        return Response({
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "is_verified": user.is_verified,
+            },
+            "profile": ProfileSerializer(profile).data
         })
