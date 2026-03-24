@@ -1,17 +1,20 @@
 from .views import(
-    ContributeView, CreateSavingsGoalView, CreateSavingsGroupView, DashboardView, GroupDetailView,
+    AnalyticsView, ContributeView, CreateSavingsGoalView, CreateSavingsGroupView, DashboardView, GroupDetailView,
     AllGroupsListView, GroupJoinRequestView, GroupRequestsListView, GroupRequestActionView,
     GoalsDashboardView, GoalDetailView,ContributeToGoalView, GroupsStatsView, JoinRequestsStatsView,
-    MyJoinedGroupsListView
+    MyJoinedGroupsListView, ProfileUpdateView
 )
 
 from django.urls import path
 
 urlpatterns = [
+    path('profile/', ProfileUpdateView.as_view(), name='profile-update'),
+    path('analytics/', AnalyticsView.as_view(), name='analytics'),
+
     path('groups/create/', CreateSavingsGroupView.as_view(), name='create-savings-group'),
     path('groups/my-joined/', MyJoinedGroupsListView.as_view(), name='my-joined-groups'),
     path('groups/all/', AllGroupsListView.as_view(), name='all-groups'),
-    path('groups/<int:id>/', GroupDetailView.as_view(), name='group-detail'),
+    path('groups/<str:public_id>/', GroupDetailView.as_view(), name='group-detail'),
 
     # Join group request endpoints
     path('groups/<int:group_id>/request_join/', GroupJoinRequestView.as_view(), name='group-request-join'),
