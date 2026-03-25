@@ -1,3 +1,5 @@
+# accounts/views.py
+
 import uuid
 import hashlib
 import logging
@@ -5,7 +7,7 @@ import cloudinary.uploader
 from django.conf import settings
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample, inline_serializer
 from .models import LedgerEntry, Wallet, SavingsGroup, Profile, GroupJoinRequest, GroupMembership, Contribution, PayoutOrder,  SavingsGoal, GoalContribution
-from .tasks import send_dawurobo_otp_async, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
+from .tasks import clear_old_idempotency_keys, process_daily_payouts, reconcile_financial_integrity, send_dawurobo_otp_async, send_goal_reminders, verify_and_invalidate_otp_sync, send_group_join_request_email_async, send_group_join_response_email_async
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django_filters.rest_framework import DjangoFilterBackend
@@ -40,6 +42,12 @@ from .serializers import (
 )
 
 from django.db.models.functions import TruncMonth
+from django_qstash import publish
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from rest_framework.permissions import IsAdminUser
+from django_qstash import stashed_task
+from django.conf import settings
 
 logger = logging.getLogger('accounts.finance')
 User = get_user_model()
@@ -470,7 +478,7 @@ class MyJoinedGroupsListView(generics.ListAPIView):
 class GroupDetailView(generics.RetrieveAPIView):
     """
     Supports BOTH:
-    - New groups: long random public_id (X/Twitter style – unguessable)
+    - New groups: long random public_id
     - Legacy groups (public_id is still NULL): falls back to numeric id
     """
     serializer_class = SavingsGroupSerializer
@@ -1657,3 +1665,43 @@ class ProfileUpdateView(APIView):
             },
             "profile": ProfileSerializer(profile).data
         })
+
+
+@csrf_exempt
+def run_daily_payouts(request):
+    """Called by Vercel Cron → triggers the daily payout orchestrator"""
+    if request.headers.get('X-Cron-Secret') != settings.QSTASH_TOKEN:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    process_daily_payouts.stash()
+    return JsonResponse({"status": "daily payouts queued successfully"})
+
+
+@csrf_exempt
+def run_reconciliation(request):
+    """Called by Vercel Cron → triggers financial integrity check"""
+    if request.headers.get('X-Cron-Secret') != settings.QSTASH_TOKEN:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    reconcile_financial_integrity.stash()
+    return JsonResponse({"status": "financial reconciliation queued successfully"})
+
+
+@csrf_exempt
+def run_clear_idempotency(request):
+    """Called by Vercel Cron → cleans up old idempotency keys"""
+    if request.headers.get('X-Cron-Secret') != settings.QSTASH_TOKEN:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    clear_old_idempotency_keys.stash()
+    return JsonResponse({"status": "idempotency cleanup queued successfully"})
+
+
+@csrf_exempt
+def run_goal_reminders(request):
+    """Called by Vercel Cron → sends daily goal reminders"""
+    if request.headers.get('X-Cron-Secret') != settings.QSTASH_TOKEN:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    send_goal_reminders.stash()
+    return JsonResponse({"status": "goal reminders queued successfully"})
