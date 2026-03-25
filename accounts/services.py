@@ -1,3 +1,5 @@
+# accounts/services.py
+
 import logging
 import uuid
 from django.db import transaction

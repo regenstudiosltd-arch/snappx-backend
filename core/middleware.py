@@ -1,3 +1,5 @@
+# core/middleware.py
+
 import uuid
 from threading import local
 from django.http import JsonResponse

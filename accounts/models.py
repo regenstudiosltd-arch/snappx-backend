@@ -1,3 +1,5 @@
+# accounts/models.py
+
 import os
 import uuid
 import random

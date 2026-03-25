@@ -1,3 +1,5 @@
+# accounts/serializers.py
+
 import os
 import html
 import hashlib
